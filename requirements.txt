@@ -1,0 +1,5 @@
+# Core: receipt signing/verification (stdlib does everything else)
+cryptography>=41.0
+
+# discord-bot/ only (optional; the QA harness does not need it)
+# discord.py>=2.3
