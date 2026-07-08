@@ -700,6 +700,7 @@ def _audit_rows(rows):
         if cnt > 1:
             findings.append(("warn", 'duplicate column name "%s" (x%d)' % (k, cnt)))
     pii = 0
+    formula_cols = 0
     for ci, name in enumerate(headers):
         fam, fine, empties, formats = {}, {}, 0, {}
         for r in data:
@@ -724,10 +725,33 @@ def _audit_rows(rows):
         if fine.get("email"): findings.append(("pii", 'PII: "%s" contains email addresses' % name)); pii += 1
         if fine.get("phone"): findings.append(("pii", 'PII: "%s" contains phone numbers' % name)); pii += 1
         if fine.get("ssn"): findings.append(("pii", 'sensitive: "%s" looks like SSNs' % name)); pii += 1
-    rank = {"pii": 0, "warn": 1, "info": 2}
-    findings.sort(key=lambda fd: rank.get(fd[0], 3))
+        # Formula injection: cells starting with = + - @ can execute code when opened in a spreadsheet.
+        # Exclude bare negative numbers (e.g. -42, -3.14) — they start with - but are not formulas.
+        def _is_formula(v):
+            v = v.lstrip()
+            if not v or not v[0] in ("=", "+", "-", "@"):
+                return False
+            if v[0] == "-":
+                try:
+                    float(v)
+                    return False  # it's a valid negative number, not a formula
+                except ValueError:
+                    pass
+            return True
+        formula_hits = [
+            (r[ci] if ci < len(r) else "") for r in data
+            if _is_formula(r[ci] if ci < len(r) else "")
+        ]
+        if formula_hits:
+            findings.append(("formula", 'formula injection: "%s" has %d cell%s starting with %s'
+                             % (name, len(formula_hits), "s" if len(formula_hits) > 1 else "",
+                                ", ".join(sorted({v.lstrip()[0] for v in formula_hits})))))
+            formula_cols += 1
+    rank = {"pii": 0, "formula": 1, "warn": 2, "info": 3}
+    findings.sort(key=lambda fd: rank.get(fd[0], 4))
     return {"headers": headers, "rows": len(data), "cols": ncol, "findings": findings,
-            "breakers": sum(1 for fd in findings if fd[0] == "warn"), "pii": pii}
+            "breakers": sum(1 for fd in findings if fd[0] == "warn"), "pii": pii,
+            "formula_cols": formula_cols}
 
 
 def cmd_audit(args):
@@ -775,7 +799,7 @@ def cmd_audit(args):
         "file": {"name": os.path.basename(path), "sha256": "sha256:" + d.sha256_hex(raw),
                  "bytes": len(raw.encode("utf-8"))},
         "audit": {"rows": res["rows"], "columns": res["cols"], "import_breakers": res["breakers"],
-                  "pii_columns": res["pii"],
+                  "pii_columns": res["pii"], "formula_injection_cols": res["formula_cols"],
                   "findings": [{"severity": s, "detail": t} for s, t in res["findings"]]},
         "network_audit": net,        # MEASURED via lsof — not asserted
         "result": "audited_with_input_warning" if input_warning else "audited",
@@ -794,15 +818,16 @@ def cmd_audit(args):
     if not res["findings"]:
         lines.append(c("✓ no structural issues found", "green"))
     else:
-        icon = {"pii": ("⚠", "purple"), "warn": ("!", "amber"), "info": ("i", "slate")}
+        icon = {"pii": ("⚠", "purple"), "formula": ("⚠", "red"), "warn": ("!", "amber"), "info": ("i", "slate")}
         for sev, det in res["findings"][:14]:
             mk, col = icon.get(sev, ("·", "slate"))
             lines.append(c(mk, col) + " " + c(det, "slate"))
         if len(res["findings"]) > 14:
             lines.append(c("  … %d more" % (len(res["findings"]) - 14), "dim"))
     lines.append("")
-    lines.append(c("%d import-breakers · %d PII columns" % (res["breakers"], res["pii"]),
-                   "amber" if res["breakers"] else "green"))
+    summary_col = "red" if res["formula_cols"] else ("amber" if res["breakers"] else "green")
+    lines.append(c("%d import-breakers · %d PII columns · %d formula injection" % (
+        res["breakers"], res["pii"], res["formula_cols"]), summary_col))
     lines.append((c("airlock ✓", "green") if ext == 0 else c("airlock ?", "amber")) +
                  c("   %s external sockets · the file never left this machine" %
                    (ext if ext is not None else "?"), "slate"))
