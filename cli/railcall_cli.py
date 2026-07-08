@@ -684,6 +684,19 @@ def _audit_family(t):
     return t
 
 
+def _is_formula(v):
+    v = v.lstrip()
+    if not v or v[0] not in ("=", "+", "-", "@"):
+        return False
+    if v[0] == "-":
+        try:
+            float(v)
+            return False  # valid negative number, not a formula
+        except ValueError:
+            pass
+    return True
+
+
 def _audit_rows(rows):
     rows = [r for r in rows if any((x or "").strip() for x in r)]
     if len(rows) < 2:
@@ -725,19 +738,6 @@ def _audit_rows(rows):
         if fine.get("email"): findings.append(("pii", 'PII: "%s" contains email addresses' % name)); pii += 1
         if fine.get("phone"): findings.append(("pii", 'PII: "%s" contains phone numbers' % name)); pii += 1
         if fine.get("ssn"): findings.append(("pii", 'sensitive: "%s" looks like SSNs' % name)); pii += 1
-        # Formula injection: cells starting with = + - @ can execute code when opened in a spreadsheet.
-        # Exclude bare negative numbers (e.g. -42, -3.14) — they start with - but are not formulas.
-        def _is_formula(v):
-            v = v.lstrip()
-            if not v or not v[0] in ("=", "+", "-", "@"):
-                return False
-            if v[0] == "-":
-                try:
-                    float(v)
-                    return False  # it's a valid negative number, not a formula
-                except ValueError:
-                    pass
-            return True
         formula_hits = [
             (r[ci] if ci < len(r) else "") for r in data
             if _is_formula(r[ci] if ci < len(r) else "")
