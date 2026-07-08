@@ -56,11 +56,18 @@ def extract_signature(receipt):
     Raises ValueError if the receipt carries no recognizable signature.
     """
     # Family 1: flat CLI audit receipt. The signature covers the canonical
-    # body (the receipt minus its own signature/public_key fields).
+    # body — the receipt minus ALL THREE signer fields (signer_alg is added
+    # alongside public_key_hex/signature_hex AFTER signing, so it is not part
+    # of the signed body; leaving it in silently breaks a genuine receipt).
+    # The canonical form MUST be byte-identical to receipt_signer.canonical_bytes,
+    # the signer's single source of truth: sort_keys, tight separators, and
+    # ensure_ascii=False (so a non-ASCII byte such as the em-dash the lsof audit
+    # emits is signed as UTF-8, not as an escaped \uXXXX sequence).
     if "signature_hex" in receipt:
         body = {k: v for k, v in receipt.items()
-                if k not in ("signature_hex", "public_key_hex")}
-        canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+                if k not in ("signer_alg", "signature_hex", "public_key_hex")}
+        canonical = json.dumps(body, sort_keys=True, separators=(",", ":"),
+                               ensure_ascii=False)
         return ("<canonical body>", canonical,
                 receipt["signature_hex"], receipt.get("key_id"))
 
