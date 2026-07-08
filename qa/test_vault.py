@@ -75,6 +75,40 @@ class TestVault(unittest.TestCase):
         self.assertFalse(vault.is_locked())
         self.assertEqual(vault.read_key("my_key"), "super_secret_value")
 
+    def test_write_key_flow(self):
+        # Test writing a key in plaintext mode
+        self.assertFalse(vault.is_locked())
+        vault.write_key("key_plaintext", "val_plaintext")
+        self.assertEqual(vault.read_key("key_plaintext"), "val_plaintext")
+        
+        with open(vault.VAULT_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            self.assertEqual(data.get("key_plaintext"), "val_plaintext")
+            self.assertFalse(data.get("_encrypted", False))
+
+        # Lock the vault by rotating it
+        passphrase = "test_passphrase"
+        vault.rotate(passphrase)
+        
+        # Test writing a key in encrypted mode (should automatically re-encrypt on disk)
+        vault.write_key("key_encrypted", "val_encrypted")
+        self.assertEqual(vault.read_key("key_encrypted"), "val_encrypted")
+        
+        # Reset memory state and unlock to verify persistency
+        vault._unlocked_keys = {}
+        vault._is_locked = True
+        
+        ok = vault.unlock(passphrase)
+        self.assertTrue(ok)
+        self.assertEqual(vault.read_key("key_plaintext"), "val_plaintext")
+        self.assertEqual(vault.read_key("key_encrypted"), "val_encrypted")
+
+        # Test writing a key while locked (should raise RuntimeError)
+        vault._is_locked = True
+        with self.assertRaises(RuntimeError):
+            vault.write_key("locked_key", "locked_val")
+
+
 
 if __name__ == "__main__":
     unittest.main()
