@@ -4,6 +4,8 @@ import hashlib
 import tempfile
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from typing import Optional
+
 VAULT_PATH = os.path.expanduser("~/.railcall/keys.local.json")
 
 # In-memory store for unlocked keys
@@ -79,7 +81,7 @@ def unlock(passphrase: str) -> bool:
         return False
 
 
-def read_key(name: str) -> str | None:
+def read_key(name: str) -> Optional[str]:
     """Return a decrypted secret by name for the caller, in memory only. None if absent."""
     if is_locked():
         return None
