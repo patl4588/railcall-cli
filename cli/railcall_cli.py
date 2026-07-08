@@ -1240,11 +1240,74 @@ def cmd_restore(args):
     return 0
 
 
+_RECEIPTS_DIR = os.path.join(getattr(d, "ROOT", os.path.expanduser("~/.railcall")), "receipts")
+
+
+def cmd_receipts(args):
+    """Browse the signed receipt history — timestamped, never overwritten.
+    usage: railcall receipts [list] [-n N]
+
+    Bug 33 fix: the verify hint now uses the full absolute path so the suggested
+    command works from any working directory, not just ~/.railcall.
+    """
+    sub = args[0] if args and not args[0].startswith("-") else "list"
+    if sub not in ("list", "ls"):
+        print(footer(ok=False, label="usage: railcall receipts list [-n N]")); return 1
+    limit = 20
+    if "-n" in args:
+        try:
+            limit = max(1, int(args[args.index("-n") + 1]))
+        except (ValueError, IndexError):
+            pass
+    try:
+        files = [f for f in os.listdir(_RECEIPTS_DIR) if f.endswith(".json")]
+    except (FileNotFoundError, OSError):
+        files = []
+    if not files:
+        print(panel([c("No receipt history yet.", "amber"),
+                     c("  Run 'railcall build', 'railcall audit <csv>', or 'railcall interpret' —", "slate"),
+                     c("  each keeps a timestamped, verifiable copy under:", "slate"),
+                     c("  " + _RECEIPTS_DIR, "dim")], title="RAILCALL · receipts", color="amber"))
+        print(footer(ok=True, label="0 receipts")); return 0
+
+    def _mtime(fn):
+        try:
+            return os.path.getmtime(os.path.join(_RECEIPTS_DIR, fn))
+        except OSError:
+            return 0.0
+    files.sort(key=_mtime, reverse=True)
+    shown = files[:limit]
+    lines = [c("history", "dim") + "   " + _RECEIPTS_DIR, ""]
+    for fn in shown:
+        schema, signed, result = "", "unsigned", ""
+        try:
+            r = json.loads(open(os.path.join(_RECEIPTS_DIR, fn), encoding="utf-8").read())
+            schema = r.get("schema") or ""
+            signed = ("ed25519-signed" if (r.get("signature_hex") or
+                      (isinstance(r.get("signature"), dict) and r["signature"].get("signature"))) else "unsigned")
+            result = r.get("result") or ("ok" if r.get("ok") else "")
+        except Exception:
+            pass
+        badge = c("✓", "green") if signed.startswith("ed25519") else c("○", "slate")
+        lines.append(badge + " " + c(fn, "cyan"))
+        lines.append(c("   " + schema + (("  · " + str(result)) if result else "") + "  · " + signed, "slate"))
+    if len(files) > len(shown):
+        lines.append("")
+        lines.append(c("  … %d more (railcall receipts list -n %d)" % (len(files) - len(shown), len(files)), "dim"))
+    lines.append("")
+    lines.append(c("verify any of them offline:", "dim"))
+    # Bug 33: use absolute path so the hint works from any working directory
+    lines.append(c("  railcall verify " + os.path.join(_RECEIPTS_DIR, shown[0]), "cyan"))
+    print(panel(lines, title="RAILCALL · receipt history (%d)" % len(files), color="cyan"))
+    print(footer(ok=True, label="%d receipt%s" % (len(files), "" if len(files) == 1 else "s")))
+    return 0
+
+
 COMMANDS = {"build": cmd_build, "interpret": cmd_interpret, "daemon": cmd_daemon,
             "start-daemon": cmd_daemon, "health": cmd_health, "dashboard": cmd_dashboard,
             "balance": cmd_balance, "login": cmd_login, "studio": cmd_studio, "audit": cmd_audit,
             "verify": cmd_verify, "backup": cmd_backup, "restore": cmd_restore,
-            "backup-verify": cmd_backup_verify}
+            "backup-verify": cmd_backup_verify, "receipts": cmd_receipts}
 
 
 def main():
