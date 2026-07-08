@@ -613,12 +613,22 @@ def cmd_login(args):
         print(footer(ok=False, label="usage: railcall login <api_key>"))
         return 1
     api_key = args[0].strip()
-    token = read_token() or {}
+    if not api_key:
+        print(panel([c("key cannot be empty — usage: railcall login <api_key>", "red")],
+                    title="RAILCALL · login", color="red"))
+        print(footer(ok=False)); return 1
+    old_token = read_token() or {}
+    token = dict(old_token)
     token["api_key"] = api_key
     write_token(token)
     print(panel([c(f"✓ saved key {api_key[:14]}…", "green") + c("  → " + TOKEN_PATH, "dim")],
                 title="RAILCALL · login", color="cyan"))
-    return cmd_balance()
+    rc = cmd_balance()
+    if rc != 0:
+        write_token(old_token)
+        print(panel([c("Previous key restored — the new key was not accepted.", "amber")],
+                    title="RAILCALL · login", color="amber"))
+    return rc
 
 
 def cmd_studio(_=None):
@@ -638,7 +648,11 @@ def cmd_studio(_=None):
                  c("  loopback only · your data stays on this machine", "dim"),
                  c("  Ctrl+C here to stop the Studio.", "dim")],
                 title="RAILCALL · studio", color="purple"))
-    import subprocess
+    import subprocess, threading, webbrowser
+    def _open_browser():
+        import time; time.sleep(1.5)
+        webbrowser.open("http://127.0.0.1:8799/v2")
+    threading.Thread(target=_open_browser, daemon=True).start()
     try:
         return subprocess.call([sys.executable, server], cwd=os.path.dirname(server))
     except KeyboardInterrupt:
