@@ -83,12 +83,29 @@ def verify_receipt(receipt: dict, trusted_keys: list) -> tuple[bool, str]:
 
 def load_trusted_keys() -> list:
     p = os.environ.get("RAILCALL_TRUSTED_KEYS")
+    if not p or not os.path.isfile(p):
+        # Fall back to standard user-level / install workspaces
+        home = os.path.expanduser("~")
+        candidate_paths = [
+            os.path.join(home, ".railcall", "signing_pubkey.json"),
+            os.path.join(home, ".railcall", "station", ".railcall_workspace", "signing_pubkey.json"),
+            os.path.join(home, ".railcall", ".railcall_workspace", "signing_pubkey.json"),
+        ]
+        for cp in candidate_paths:
+            if os.path.isfile(cp):
+                p = cp
+                break
+
     if p and os.path.isfile(p):
         try:
             with open(p, "r", encoding="utf-8") as f:
-                return json.load(f)
+                doc = json.load(f)
+                if isinstance(doc, list):
+                    return doc
+                elif isinstance(doc, dict):
+                    return [doc]
         except Exception:
-            return []
+            pass
     return []
 
 

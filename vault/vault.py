@@ -16,8 +16,8 @@ _current_passphrase = None
 
 def _get_vault_path() -> str:
     d = os.path.dirname(VAULT_PATH)
-    if d and not os.path.exists(d):
-        return "keys.local.json"
+    if d:
+        os.makedirs(d, exist_ok=True)
     return VAULT_PATH
 
 
@@ -139,3 +139,41 @@ def rotate(new_passphrase: str) -> None:
         except OSError:
             pass
         raise
+
+
+def write_key(name: str, val: str) -> None:
+    """Set a secret key in the vault and save/re-encrypt to disk if unlocked."""
+    global _unlocked_keys, _is_locked, _current_passphrase
+    if is_locked():
+        raise RuntimeError("Cannot write keys while vault is locked.")
+    _unlocked_keys[name] = val
+    if _current_passphrase is not None:
+        rotate(_current_passphrase)
+    else:
+        # Plaintext write if not encrypted yet
+        path = _get_vault_path()
+        directory = os.path.dirname(os.path.abspath(path)) or "."
+        os.makedirs(directory, exist_ok=True)
+        
+        fd, tmp = tempfile.mkstemp(prefix=".keys-", suffix=".tmp", dir=directory)
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                content = json.dumps(_unlocked_keys, indent=2) + "\n"
+                f.write(content.encode("utf-8"))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            if hasattr(os, "chmod"):
+                try:
+                    os.chmod(path, 0o600)
+                except OSError:
+                    pass
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
