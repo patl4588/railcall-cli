@@ -1,8 +1,8 @@
 import os
 import json
-import hashlib
 import tempfile
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
 from typing import Optional
 
@@ -38,8 +38,11 @@ def is_locked() -> bool:
 
 
 def _derive_key(passphrase: str, salt: bytes) -> bytes:
-    """Derive a 256-bit key using scrypt."""
-    return hashlib.scrypt(passphrase.encode('utf-8'), salt=salt, n=16384, r=8, p=1, dklen=32)
+    """Derive a 256-bit key with scrypt via `cryptography` (already a dependency here for AES-GCM).
+    The stdlib hashlib.scrypt needs a Python built against OpenSSL's scrypt and is ABSENT on some
+    platforms (e.g. stock macOS python), which broke the vault there; this path is portable and RFC
+    7914-identical, so a vault sealed on one OS unlocks on another with the same params."""
+    return Scrypt(salt=salt, length=32, n=16384, r=8, p=1).derive(passphrase.encode("utf-8"))
 
 
 def unlock(passphrase: str) -> bool:
