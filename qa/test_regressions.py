@@ -132,6 +132,7 @@ class RailCallRegressions(unittest.TestCase):
     def run_cli(self, args, ws=None):
         env = dict(os.environ)
         env["HOME"] = self.home
+        env["USERPROFILE"] = self.home
         pp = [self.install]
         if _CRYPTO_SITE:
             pp.append(_CRYPTO_SITE)
