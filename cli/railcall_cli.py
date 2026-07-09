@@ -13,21 +13,36 @@ Premium TUI: pure-stdlib box-drawing + ANSI — ZERO third-party deps (no rich),
 install stays a 2-file curl|bash and the airlock metering is never touched by rendering.
 
   railcall                         dashboard: workspace + daemon/model status + commands
+  railcall demo                    30-second golden path: build a sample workflow locally,
+                                   mint a REAL signed receipt, and verify it offline (no network)
   railcall build [path/to.csv]     local CSV compile + recursive socket audit + receipt
   railcall interpret "<prompt>"    local NL pass via Ollama, airlock-proven
                                    (model auto-detected; override: RAILCALL_OLLAMA_MODEL=<name>)
   railcall daemon                  start the loopback companion daemon (127.0.0.1:8555)
   railcall health                  daemon reachability + a socket audit of this process
+  railcall doctor                  check the local environment (python, cryptography, Ollama,
+                                   PATH, token, gateway) — each line PASS/WARN/FAIL + the exact fix
   railcall balance                 live run balance from the gateway
   railcall login <key>             save your rc_live_ key, then verify balance
   railcall verify [receipt]        re-check a receipt offline — no network, no trust
                                    (--key <signing_pubkey.json|dir> = verify against an explicit key)
+  railcall rotate-key              mint a fresh Ed25519 signing keypair; archive the old public key
+                                   (signing_pubkey.prev-<ts>.json) so pre-rotation receipts still verify
 
 Paid runs (a saved rc_live_ key) are booked against the server-side prepaid balance via the
 gateway's /meter after each successful build/interpret; free-trial runs stay fully local.
 """
 import sys
 import os
+
+# Windows console encoding helper: force UTF-8 to prevent cp1252 UnicodeEncodeErrors
+if sys.platform.startswith("win") or os.name == "nt":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except AttributeError:
+        pass
+
 import re
 import ast
 import json
@@ -66,6 +81,98 @@ def write_token(token):
     os.chmod(tmp, 0o600)            # final file is never even briefly world-readable
     os.replace(tmp, TOKEN_PATH)
     os.chmod(TOKEN_PATH, 0o600)     # belt-and-suspenders: BYOK key file is 0600
+
+
+# --------------------------------------------------- receipt history + audit log (community: Sami, bugs 20/27/28)
+# A governed run must never destroy the proof of the last one, and every run should leave an append-only
+# trail. Both live NEXT TO the canonical receipts in the daemon ROOT. Both are BEST-EFFORT — a history or
+# log failure is swallowed and can NEVER break or fail a real run.
+# Unify workspace paths between CLI and Studio (Finding 01 / community feedback)
+_home = os.path.expanduser("~")
+_station_workspace = os.path.join(_home, ".railcall", "station", ".railcall_workspace")
+if os.path.isdir(_station_workspace):
+    RECEIPTS_DIR = os.path.join(_station_workspace, "receipts")
+    AUDIT_LOG_PATH = os.path.join(_station_workspace, "audit_log.jsonl")
+else:
+    RECEIPTS_DIR = os.path.join(getattr(d, "ROOT", os.path.join(_home, ".railcall")), "receipts")
+    AUDIT_LOG_PATH = os.path.join(getattr(d, "ROOT", os.path.join(_home, ".railcall")), "audit_log.jsonl")
+
+
+def _receipt_key_id(receipt):
+    """The signing key_id to record in the trail — from the receipt's own signature block (Studio shape),
+    else THIS install's pinned key doc, else a short fingerprint of the receipt's public key. NEVER a
+    secret and NEVER the API key."""
+    sig = receipt.get("signature")
+    if isinstance(sig, dict) and sig.get("key_id"):
+        return sig["key_id"]
+    doc = _install_pubkey()
+    if isinstance(doc, dict) and doc.get("key_id"):
+        return doc["key_id"]
+    pk = receipt.get("public_key_hex")
+    return ("pk:" + pk[:16]) if isinstance(pk, str) and pk else None
+
+
+def _archive_and_log(command, canonical_path, ok=True):
+    """After a governed run writes its canonical (fixed-name) receipt, ALSO (1) keep a timestamped HISTORY
+    copy under receipts/ so a later run can't overwrite this proof (bugs 20/27), and (2) append one
+    structured line to audit_log.jsonl (bug 28). Reads the receipt straight off disk so the archived bytes
+    are EXACTLY what was signed. Returns the history path, or None. Best-effort: any failure is swallowed."""
+    try:
+        receipt = json.loads(open(canonical_path, encoding="utf-8").read())
+    except Exception:
+        return None
+    history_path = None
+    try:
+        os.makedirs(RECEIPTS_DIR, exist_ok=True)
+        schema = str(receipt.get("schema") or command or "receipt").replace("/", "_").replace("..", "")
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        cand = os.path.join(RECEIPTS_DIR, "%s-%s.json" % (schema, stamp))
+        n = 1
+        while os.path.exists(cand):   # collision-safe within the same second
+            cand = os.path.join(RECEIPTS_DIR, "%s-%s-%d.json" % (schema, stamp, n)); n += 1
+        d._save_receipt(cand, receipt)   # same atomic 0600 writer as the canonical receipt
+        history_path = cand
+    except Exception:
+        history_path = None
+    try:
+        entry = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "command": command,
+            "schema": receipt.get("schema"),
+            "key_id": _receipt_key_id(receipt),
+            "signed": bool(receipt.get("signature_hex") or
+                           (isinstance(receipt.get("signature"), dict) and receipt["signature"].get("signature"))),
+            "receipt": os.path.basename(canonical_path),
+            "history": os.path.basename(history_path) if history_path else None,
+            "ok": bool(ok),
+        }
+        with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
+    return history_path
+
+
+# --------------------------------------------------- CSV formula-injection detection (community: Sami, bug 13)
+_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _is_formula_injection(cell):
+    """CSV/spreadsheet formula-injection candidate (OWASP): a cell a spreadsheet app could EXECUTE on open.
+    True when the first meaningful char is a formula trigger (= + - @ TAB CR) — after stripping a leading
+    quote/space a spreadsheet ignores — EXCEPT (a) clean numbers, so -5 / +3.14 / 1e3 stay data, and
+    (b) a lone trigger char, so a bare '-' placeholder isn't flagged."""
+    s = cell or ""
+    if not s:
+        return False
+    s2 = s.lstrip(" '\"")
+    if len(s2) < 2 or s2[0] not in _FORMULA_TRIGGERS:
+        return False
+    try:                               # a clean number is data, never a formula
+        float(s2.replace(",", "").replace(" ", ""))
+        return False
+    except ValueError:
+        return True
 
 
 # ----------------------------------------------------------------- TUI (stdlib only)
@@ -293,26 +400,39 @@ def cmd_dashboard(_=None):
     don, oon = daemon_online(), ollama_online()
     tok = read_token() or {}
     runs = tok.get("runs_remaining")
+    # Show the model the CLI would ACTUALLY use — auto-detected from local Ollama the same way
+    # `railcall interpret` / `railcall doctor` do (query /api/tags, ~2s) — not a hardcoded default
+    # that may not be installed. When Ollama is reachable but no model resolves, say so honestly
+    # rather than claiming a model that isn't pulled.
+    if oon:
+        det_model, _dm_note, _dm_err = _resolve_ollama_model()
+        model_line = (c(f"{det_model} (local Ollama)", "green") if det_model
+                      else c("Ollama reachable · no model installed", "amber"))
+    else:
+        model_line = c("Ollama not reachable on :11434", "amber")
     head = [
         c("RAILCALL", "bold") + c("  ·  local companion CLI", "slate"),
         "",
         c("workspace", "dim") + "  " + str(d.ROOT),
         c("daemon   ", "dim") + "  " + (c(f"online ({d.HOST}:{d.PORT})", "green") if don
                                         else c("offline — railcall daemon", "amber")),
-        c("model    ", "dim") + "  " + (c(f"{d.OLLAMA_MODEL} (local Ollama)", "green") if oon
-                                        else c("Ollama not reachable on :11434", "amber")),
+        c("model    ", "dim") + "  " + model_line,
     ]
     print(panel(head, title="RAILCALL", color="purple"))
     cmds = [
+        c("demo", "cyan") + "               30-second golden path: build → signed receipt → offline verify",
         c("studio", "cyan") + "             open the visual Studio in your browser (127.0.0.1:8799)",
         c("build", "cyan") + c(" [csv]", "dim") + "        local compile + socket audit + receipt",
         c("audit", "cyan") + c(" <csv>", "dim") + "        zero-retention structural audit + signed receipt",
         c("verify", "cyan") + c(" [receipt]", "dim") + "   re-check the last receipt offline — no network, no trust",
+        c("receipts", "cyan") + c(" list", "dim") + "   browse the signed receipt history — timestamped, never overwritten",
         c("interpret", "cyan") + c(' "<prompt>"', "dim") + "  local NL pass (Ollama), airlock-proven",
         c("daemon", "cyan") + "             start loopback daemon on 127.0.0.1:8555",
         c("health", "cyan") + "             daemon + socket-audit status",
+        c("doctor", "cyan") + "             check the local environment (PASS/WARN/FAIL + the exact fix)",
         c("balance", "cyan") + "            live run balance from the gateway",
         c("login", "cyan") + c(" <key>", "dim") + "        save your rc_live_ key, then verify",
+        c("rotate-key", "cyan") + "         mint a fresh Ed25519 signing key (archives the old public key)",
         "",
         c("no fake balances — every number here is measured.", "dim"),
     ]
@@ -346,9 +466,26 @@ def cmd_build(args):
         print(footer(ok=False, runs=0))
         return 1
 
+    # A SUPPLIED dataset path that doesn't exist is an honest error — never silently fall
+    # back to the built-in sample and mint a green receipt over data the user never gave us
+    # (contest finding #14: silent power-grid fallback). The sample is the default ONLY when
+    # no path was supplied.
+    supplied = bool(args)
     csv_path = args[0] if args else os.path.join(d.ROOT, "fixtures", "metrics.csv")
+    if supplied and not os.path.exists(csv_path):
+        print(panel([c("dataset not found:", "red"), c("  " + csv_path, "slate"), "",
+                     c("check the path, or run 'railcall build' with no argument to use the sample.", "dim")],
+                    title="RAILCALL · build", color="red"))
+        print(footer(ok=False, runs=runs_left))
+        return 1
     if os.path.exists(csv_path):
-        csv_data, src = open(csv_path, encoding="utf-8").read(), csv_path
+        try:
+            csv_data, src = open(csv_path, encoding="utf-8").read(), csv_path
+        except Exception as _e:
+            print(panel([c("could not read dataset:", "red"), c("  " + csv_path, "slate"),
+                         c("  " + str(_e), "dim")], title="RAILCALL · build", color="red"))
+            print(footer(ok=False, runs=runs_left))
+            return 1
     else:
         csv_data = ("metric_id,component,load_value,status\n"
                     "M-101,generator-alpha,87.4,active\n"
@@ -383,6 +520,9 @@ def cmd_build(args):
             ok, detail = _meter_run(api_key, 1)
             lines.append((c("billing ✓", "green") if ok else c("billing ⚠", "amber")) +
                          c("   " + detail, "slate"))
+    history_path = _archive_and_log("build", str(d.RECEIPT_PATH), ok=result.get("ok"))  # history + audit_log
+    if history_path:
+        lines.append(c("history", "dim") + "   " + os.path.join(RECEIPTS_DIR, os.path.basename(history_path)))
     print(panel(lines, title="RAILCALL · local compile", color="cyan"))
     print(footer(ok=result.get("ok"), runs=new_left))
     return 0 if result.get("ok") else 1
@@ -462,8 +602,12 @@ def cmd_interpret(args):
         print(footer(ok=False, runs=0))
         return 1
     if not ollama_online():
-        print(panel([c("Ollama not reachable on localhost:11434 — start it first.", "amber")],
+        print(panel([c("The local model server (Ollama) isn't answering on 127.0.0.1:11434.", "amber"),
+                     c("  Only `railcall interpret` needs it; build / audit / verify don't.", "slate"),
+                     c("  Fix:  ollama serve      (first time, also: ollama pull " + d.OLLAMA_MODEL + ")", "cyan"),
+                     c("  No run was metered — your balance is untouched.", "dim")],
                     title="RAILCALL · interpret", color="amber"))
+        print(footer(ok=False))
         return 1
     model, model_note, model_err = _resolve_ollama_model()
     if model_err:
@@ -480,7 +624,11 @@ def cmd_interpret(args):
     a = res["airlock"]
     ext = a.get("during_call_external_sockets")
     if res.get("ollama_error"):
-        print(panel([c(f"ollama error: {res['ollama_error']}", "red")], title="RAILCALL · interpret", color="red"))
+        print(panel([c("The local model call failed mid-run — nothing was written or sent.", "red"),
+                     c("  Ollama said: " + str(res["ollama_error"]), "slate"),
+                     c("  Common fixes: pull the model (ollama pull %s), or free memory and retry." % d.OLLAMA_MODEL, "cyan"),
+                     c("  No run was metered — your balance is untouched.", "dim")],
+                    title="RAILCALL · interpret", color="red"))
         print(footer(ok=False))
         return 1
     body = (res.get("response") or "(empty)").strip().replace("\n", "\n")
@@ -535,6 +683,9 @@ def cmd_interpret(args):
         ok, detail = _meter_run(api_key, 1)
         lines.append((c("billing ✓", "green") if ok else c("billing ⚠", "amber")) +
                      c("   " + detail, "slate"))
+    history_path = _archive_and_log("interpret", str(d.INTERPRET_RECEIPT_PATH), ok=True)  # history + audit_log
+    if history_path:
+        lines.append(c("history", "dim") + "   " + os.path.join(RECEIPTS_DIR, os.path.basename(history_path)))
     print(panel(lines, title="RAILCALL · local NL interpret", color="cyan"))
     print(footer(ok=True, runs=token["runs_remaining"]))
     return 0
@@ -565,6 +716,113 @@ def cmd_health(_=None):
     return 0
 
 
+def cmd_doctor(_=None):
+    """Check the local environment for the exact classes of failure that break local runs — an old
+    python, no `cryptography` (so receipts mint UNSIGNED), a PEP-668 pip refusal, an unreachable or
+    empty Ollama, ~/.railcall/bin off PATH, a missing token — and report each honestly PASS/WARN/FAIL
+    with the exact fix. Reaches the network for ONE 2s gateway ping only; offline is a fully-supported
+    state for local build/audit/interpret, so it is reported as fine, never as a failure."""
+    lines = []
+    worst = 0   # 0 = pass, 1 = warn, 2 = fail — drives the summary + exit code
+
+    def rec(status, text, fix=None):
+        nonlocal worst
+        worst = max(worst, {"PASS": 0, "WARN": 1, "FAIL": 2}[status])
+        col = {"PASS": "green", "WARN": "amber", "FAIL": "red"}[status]
+        lines.append(c(status, col) + "  " + text)
+        if fix:
+            lines.append(c("      → " + fix, "dim"))
+
+    # python3 version
+    v = sys.version_info
+    if v >= (3, 8):
+        rec("PASS", "python %d.%d.%d (>= 3.8)" % (v.major, v.minor, v.micro))
+    else:
+        rec("FAIL", "python %d.%d.%d is too old — RailCall needs >= 3.8" % (v.major, v.minor, v.micro),
+            "install a newer python3 (e.g. brew install python@3.12), then re-run this")
+
+    # cryptography — without it receipts are honestly UNSIGNED (still airlock-measured)
+    try:
+        import cryptography  # noqa: F401
+        ver = getattr(cryptography, "__version__", "?")
+        rec("PASS", "cryptography %s importable — receipts are Ed25519-SIGNED" % ver)
+    except Exception:
+        rec("WARN", "cryptography NOT importable — receipts will mint UNSIGNED (still airlock-measured)",
+            "python3 -m pip install --user --break-system-packages cryptography")
+
+    # Ollama (only `railcall interpret` needs it) + which model is actually installed
+    env_model = os.environ.get("RAILCALL_OLLAMA_MODEL")
+    tags_url = d.OLLAMA_URL.rsplit("/api/", 1)[0] + "/api/tags"
+    try:
+        with urllib.request.urlopen(tags_url, timeout=2) as r:
+            models = [m.get("name") for m in json.loads(r.read().decode("utf-8")).get("models", [])
+                      if m.get("name")]
+        if env_model:
+            if env_model in models:
+                rec("PASS", "Ollama reachable on :11434 · custom model %s installed (via RAILCALL_OLLAMA_MODEL)" % env_model)
+            else:
+                rec("WARN", "Ollama reachable but custom model %s NOT installed (via RAILCALL_OLLAMA_MODEL)" % env_model,
+                    "ollama pull " + env_model)
+        elif not models:
+            rec("WARN", "Ollama reachable on :11434 but NO models installed (interpret needs one)",
+                "ollama pull " + d.OLLAMA_MODEL)
+        elif d.OLLAMA_MODEL in models:
+            rec("PASS", "Ollama reachable on :11434 · default model %s installed" % d.OLLAMA_MODEL)
+        else:
+            rec("PASS", "Ollama reachable on :11434 · using auto-detected model %s (default %s not installed)"
+                % (models[0], d.OLLAMA_MODEL))
+    except Exception:
+        rec("WARN", "Ollama not reachable on 127.0.0.1:11434 (only 'railcall interpret' needs it)",
+            "start it (ollama serve) then: ollama pull " + d.OLLAMA_MODEL)
+
+    # ~/.railcall/bin on PATH — the install.sh shim lives here
+    bindir = os.path.join(os.path.expanduser("~"), ".railcall", "bin")
+    if bindir in os.environ.get("PATH", "").split(os.pathsep):
+        rec("PASS", "~/.railcall/bin is on PATH")
+    else:
+        is_windows = os.name == "nt" or sys.platform.startswith(("win", "msys", "cygwin")) or "MSYSTEM" in os.environ
+        if is_windows:
+            rec("WARN", "~/.railcall/bin is NOT on PATH — the 'railcall' shim may not be found",
+                'For Git Bash/MINGW: export PATH="$HOME/.railcall/bin:$PATH"  (add to ~/.bashrc); for cmd: setx PATH "%PATH%;%USERPROFILE%\\.railcall\\bin"')
+        else:
+            rec("WARN", "~/.railcall/bin is NOT on PATH — the 'railcall' shim may not be found",
+                'export PATH="$HOME/.railcall/bin:$PATH"   (add that line to ~/.zshrc or ~/.bashrc)')
+
+    # token.json present + shape (never print the full key)
+    tok = read_token()
+    if tok is None:
+        rec("WARN", "token.json not found at " + TOKEN_PATH + " (build/interpret need it)",
+            "curl -fsSL https://railcall.ai/install.sh | bash   (or: railcall login <key>)")
+    elif not isinstance(tok, dict) or not tok.get("api_key"):
+        rec("WARN", "token.json present but has no api_key field",
+            "railcall login <your rc_… key>")
+    else:
+        ak = str(tok.get("api_key"))
+        runs = tok.get("runs_remaining")
+        rec("PASS", "token.json present · key %s… · runs_remaining %s"
+            % (ak[:12], runs if isinstance(runs, int) else "?"))
+
+    # gateway ping — 2s, honest, and offline is FINE (local runs need no network)
+    gw = _gateway()
+    if _probe(gw + "/health", timeout=2):
+        rec("PASS", "gateway reachable at " + gw + " (live balance + metering)")
+    else:
+        # a fully-supported state, not a failure — do NOT inflate the summary
+        lines.append(c("PASS", "green") + "  gateway offline at " + gw
+                     + " — FINE; local build/audit/interpret need no network")
+
+    summary = {
+        0: c("✓ environment is ready for local runs", "green"),
+        1: c("⚠ usable, but some features are degraded — apply the → fixes above", "amber"),
+        2: c("✗ blocking problem — fix the FAIL line above before running", "red"),
+    }[worst]
+    lines.append("")
+    lines.append(summary)
+    print(panel(lines, title="RAILCALL · doctor", color="purple"))
+    print(footer(ok=(worst < 2), label={0: "Ready", 1: "Degraded", 2: "Blocked"}[worst]))
+    return 0 if worst < 2 else 1
+
+
 def cmd_balance(_=None):
     """Query the live gateway for this key's MEASURED balance — no fake numbers."""
     token = read_token()
@@ -587,9 +845,25 @@ def cmd_balance(_=None):
             err = e
     if err is not None:
         code = getattr(err, "code", None)
-        msg = ("gateway does not recognize this api_key (no consumer row)" if code == 401
-               else f"cannot reach gateway ({code or type(err).__name__})")
-        print(panel([c("✗ " + msg, "amber" if code == 401 else "red")], title="RAILCALL · balance", color="red"))
+        if code == 401:
+            # bad/unrecognized key: say WHAT happened + the exact recovery step
+            lines = [
+                c("✗ the gateway does not recognize this key (401 — no account on file)", "amber"),
+                c("  The saved key isn't a provisioned rc_live_/rc_free_ account, or it was rotated.", "slate"),
+                c("  Fix:  railcall login <your rc_live_… key>   (copy it from your railcall.ai dashboard)", "cyan"),
+                c("  New here?  curl -fsSL https://railcall.ai/install.sh | bash", "dim"),
+            ]
+        else:
+            # gateway unreachable: name the host, reassure that local work still runs, give the fix
+            gw = _gateway()
+            lines = [
+                c("✗ couldn't reach the billing gateway (%s)" % (code or type(err).__name__), "red"),
+                c("  " + gw + " is unreachable — you're likely offline, or it's briefly down.", "slate"),
+                c("  Local build / audit / interpret need NO network and still work right now.", "slate"),
+                c("  Fix:  check your connection and retry, or point at another gateway with", "cyan"),
+                c("        RAILCALL_GATEWAY_URL=<url> railcall balance", "cyan"),
+            ]
+        print(panel(lines, title="RAILCALL · balance", color=("amber" if code == 401 else "red")))
         print(footer(ok=False))
         return 1
     runs = data.get("runs_remaining")
@@ -648,11 +922,7 @@ def cmd_studio(_=None):
                  c("  loopback only · your data stays on this machine", "dim"),
                  c("  Ctrl+C here to stop the Studio.", "dim")],
                 title="RAILCALL · studio", color="purple"))
-    import subprocess, threading, webbrowser
-    def _open_browser():
-        import time; time.sleep(1.5)
-        webbrowser.open("http://127.0.0.1:8799/v2")
-    threading.Thread(target=_open_browser, daemon=True).start()
+    import subprocess
     try:
         return subprocess.call([sys.executable, server], cwd=os.path.dirname(server))
     except KeyboardInterrupt:
@@ -714,6 +984,7 @@ def _audit_rows(rows):
         if cnt > 1:
             findings.append(("warn", 'duplicate column name "%s" (x%d)' % (k, cnt)))
     pii = 0
+    injection = 0
     for ci, name in enumerate(headers):
         fam, fine, empties, formats = {}, {}, 0, {}
         for r in data:
@@ -738,10 +1009,15 @@ def _audit_rows(rows):
         if fine.get("email"): findings.append(("pii", 'PII: "%s" contains email addresses' % name)); pii += 1
         if fine.get("phone"): findings.append(("pii", 'PII: "%s" contains phone numbers' % name)); pii += 1
         if fine.get("ssn"): findings.append(("pii", 'sensitive: "%s" looks like SSNs' % name)); pii += 1
-    rank = {"pii": 0, "warn": 1, "info": 2}
-    findings.sort(key=lambda fd: rank.get(fd[0], 3))
+        inj = sum(1 for r in data if _is_formula_injection(r[ci] if ci < len(r) else ""))
+        if inj:
+            findings.append(("risk", 'CSV injection: "%s" has %d cell%s starting with a formula trigger '
+                             '(= + - @) — could execute if opened in Excel/Sheets' % (name, inj, "" if inj == 1 else "s")))
+            injection += inj
+    rank = {"risk": 0, "pii": 1, "warn": 2, "info": 3}
+    findings.sort(key=lambda fd: rank.get(fd[0], 4))
     return {"headers": headers, "rows": len(data), "cols": ncol, "findings": findings,
-            "breakers": sum(1 for fd in findings if fd[0] == "warn"), "pii": pii}
+            "breakers": sum(1 for fd in findings if fd[0] == "warn"), "pii": pii, "injection": injection}
 
 
 def cmd_audit(args):
@@ -757,23 +1033,58 @@ def cmd_audit(args):
     import csv as _csv
     import io as _io
     raw = open(path, encoding="utf-8", errors="replace").read()
+    file_ext = os.path.splitext(path)[1].lower()
+    head_ch = raw.lstrip()[:1]
+
+    def _reject(reason):
+        """REJECT clearly-non-tabular input: print a refusal, mint NO receipt, exit non-zero.
+        `railcall audit` structurally audits delimited tables (.csv/.tsv) — a system file, a JSON
+        blob, or a binary is not a spreadsheet, and minting an 'audited' receipt for one misleads."""
+        print(panel([c("Refusing to audit — this isn't a CSV/TSV table.", "red"),
+                     c("  " + path, "slate"),
+                     c("  " + reason, "slate"),
+                     c("  `railcall audit` structurally audits delimited tables (.csv/.tsv).", "slate"),
+                     c("  No receipt was minted — point it at a CSV/TSV export instead.", "dim")],
+                    title="RAILCALL · audit", color="red"))
+        print(footer(ok=False, label="Rejected — not a CSV/TSV table"))
+        return 1
+
+    # Binary content (NUL bytes) is never a CSV/TSV table and would otherwise crash the csv reader.
+    if file_ext not in (".csv", ".tsv") and "\x00" in raw:
+        return _reject("content contains NUL bytes (binary, not text)")
+
     sniff_ok = True
     try:
         dialect = _csv.Sniffer().sniff(raw[:4096], delimiters=",\t;|")
     except Exception:
         dialect = _csv.excel
         sniff_ok = False
-    res = _audit_rows(list(_csv.reader(_io.StringIO(raw), dialect)))
+    try:
+        parsed_rows = list(_csv.reader(_io.StringIO(raw), dialect))
+    except _csv.Error:
+        # a genuine table parses cleanly; a parser blow-up means this isn't one
+        if file_ext not in (".csv", ".tsv"):
+            return _reject("content could not be parsed as a delimited table")
+        raise
+    res = _audit_rows(parsed_rows)
     if res is None:
         print(panel([c("Need a header row + at least one data row.", "amber")], title="RAILCALL · audit", color="amber"))
         print(footer(ok=False)); return 1
-    # Honesty gate: don't silently audit a JSON blob as a "30 rows x 1 col spreadsheet".
-    # Warn LOUDLY when the input doesn't look like CSV — still proceed, but the receipt says so.
+    # Rejection gate (BUG 12): REJECT only when BOTH hold — the extension isn't .csv/.tsv AND the
+    # content doesn't parse as delimited tabular data. A .csv/.tsv file, or a non-CSV extension whose
+    # content DOES parse as a multi-column table, keeps prior behavior exactly.
+    non_tabular = []
+    if head_ch in ("{", "["):
+        non_tabular.append("content is JSON-like (starts with %r)" % head_ch)
+    if not sniff_ok and res["cols"] == 1:
+        non_tabular.append("no delimiter detected — only one column parsed per line")
+    if file_ext not in (".csv", ".tsv") and non_tabular:
+        return _reject("; ".join(non_tabular))
+    # Honesty gate: for input that survives the reject (e.g. a non-CSV extension whose content
+    # still parses as a table) warn LOUDLY when it doesn't look like CSV — proceed, receipt says so.
     not_csv_reasons = []
-    file_ext = os.path.splitext(path)[1].lower()
     if file_ext not in (".csv", ".tsv"):
         not_csv_reasons.append("extension %s is not .csv/.tsv" % (file_ext or "(none)"))
-    head_ch = raw.lstrip()[:1]
     if head_ch in ("{", "["):
         not_csv_reasons.append("content starts with %r (JSON-like)" % head_ch)
     if not sniff_ok and res["cols"] == 1:
@@ -789,7 +1100,7 @@ def cmd_audit(args):
         "file": {"name": os.path.basename(path), "sha256": "sha256:" + d.sha256_hex(raw),
                  "bytes": len(raw.encode("utf-8"))},
         "audit": {"rows": res["rows"], "columns": res["cols"], "import_breakers": res["breakers"],
-                  "pii_columns": res["pii"],
+                  "pii_columns": res["pii"], "formula_injection_cells": res.get("injection", 0),
                   "findings": [{"severity": s, "detail": t} for s, t in res["findings"]]},
         "network_audit": net,        # MEASURED via lsof — not asserted
         "result": "audited_with_input_warning" if input_warning else "audited",
@@ -799,6 +1110,7 @@ def cmd_audit(args):
     d._sign_receipt(receipt)         # Ed25519 if a key is vaulted; honestly unsigned otherwise
     receipt_path = os.path.join(d.ROOT, "railcall_audit_receipt.json")
     d._save_receipt(receipt_path, receipt)
+    history_path = _archive_and_log("audit", receipt_path, ok=True)   # timestamped history + audit_log.jsonl
     ext = net.get("external_sockets_open")
     lines = [c("file", "dim") + "   " + os.path.basename(path) +
              c("   %d rows x %d cols" % (res["rows"], res["cols"]), "slate"), ""]
@@ -808,20 +1120,24 @@ def cmd_audit(args):
     if not res["findings"]:
         lines.append(c("✓ no structural issues found", "green"))
     else:
-        icon = {"pii": ("⚠", "purple"), "warn": ("!", "amber"), "info": ("i", "slate")}
+        icon = {"risk": ("‼", "red"), "pii": ("⚠", "purple"), "warn": ("!", "amber"), "info": ("i", "slate")}
         for sev, det in res["findings"][:14]:
             mk, col = icon.get(sev, ("·", "slate"))
             lines.append(c(mk, col) + " " + c(det, "slate"))
         if len(res["findings"]) > 14:
             lines.append(c("  … %d more" % (len(res["findings"]) - 14), "dim"))
     lines.append("")
-    lines.append(c("%d import-breakers · %d PII columns" % (res["breakers"], res["pii"]),
-                   "amber" if res["breakers"] else "green"))
+    lines.append(c("%d import-breakers · %d PII columns · %d formula-injection cells" %
+                   (res["breakers"], res["pii"], res.get("injection", 0)),
+                   "red" if res.get("injection") else ("amber" if res["breakers"] else "green")))
     lines.append((c("airlock ✓", "green") if ext == 0 else c("airlock ?", "amber")) +
                  c("   %s external sockets · the file never left this machine" %
                    (ext if ext is not None else "?"), "slate"))
     signed = "ed25519-signed" if receipt.get("signature_hex") else "unsigned (pip install cryptography to sign)"
     lines.append(c("receipt", "dim") + "   " + receipt_path + c("  · " + signed, "dim"))
+    if history_path:
+        lines.append(c("history", "dim") + "   " + os.path.join(RECEIPTS_DIR, os.path.basename(history_path)) +
+                     c("  · railcall receipts list", "dim"))
     print(panel(lines, title="RAILCALL · local audit", color="cyan"))
     print(footer(ok=True, label="Audited (input warning)" if input_warning else None))
     return 0
@@ -853,11 +1169,15 @@ def _install_pubkey():
     return None
 
 
-def _verify_studio_receipt(receipt, path, user_key=None):
+def _verify_studio_receipt(receipt, path, user_key=None, explain=False):
     """Verify a Studio/workflow receipt: its 'signature' block signs the integrity field STRING
     (integrity_hash for builds, integrity for runs, integrity_root for workflow receipts), checked
     against this install's pinned signing_pubkey.json — or, when the user passed --key, against
-    THAT key, with the trust clearly attributed in the output. `user_key` is (doc, path)."""
+    THAT key, with the trust clearly attributed in the output. `user_key` is (doc, path). When
+    `explain` is set, every check is traced to stdout as it runs; output is otherwise unchanged."""
+    def ex(msg):
+        if explain:
+            print(c("  · " + msg, "dim"))
     sb = receipt.get("signature") or {}
     # BUILD receipts carry integrity_hash; RUN receipts carry integrity; workflow
     # receipts carry integrity_root — same precedence as the routing check.
@@ -866,10 +1186,14 @@ def _verify_studio_receipt(receipt, path, user_key=None):
     key_id = sb.get("key_id"); alg = sb.get("alg", "ed25519")
     net = receipt.get("network_audit") or {}
     ext = net.get("external_sockets_open")
+    ex("integrity field read: %s = %r" % (ih_field, ih))
+    ex("receipt signature alg %s · key_id %s" % (alg, key_id))
     if user_key is not None:
         doc, key_src = user_key
     else:
         doc, key_src = _install_pubkey(), None
+    ex("trust key source: %s" % ("--key %s (user-supplied)" % key_src if key_src
+                                 else "this install's pinned signing_pubkey.json"))
     if doc is None:
         print(panel([c("Studio receipt — need this install's signing key to verify offline.", "amber"),
                      c("  Verify inside the Studio (PROOF rail → VERIFY ALL FROM DISK), or run this on the", "slate"),
@@ -878,6 +1202,10 @@ def _verify_studio_receipt(receipt, path, user_key=None):
                      c("    railcall verify <receipt.json> --key <signing_pubkey.json>", "cyan")],
                     title="RAILCALL · verify", color="amber"))
         print(footer(ok=False)); return 1
+    ex("pinned key_id %s vs receipt key_id %s → %s"
+       % (doc.get("key_id"), key_id,
+          "MATCH" if (key_id and doc.get("key_id") and key_id == doc.get("key_id"))
+          else ("MISMATCH (different install)" if key_id and doc.get("key_id") else "no key_id to compare")))
     if key_id and doc.get("key_id") and key_id != doc.get("key_id"):
         who = ("the --key you supplied" if key_src else "this install")
         print(panel([c("Studio receipt signed by a DIFFERENT key than %s." % who, "amber"),
@@ -894,9 +1222,15 @@ def _verify_studio_receipt(receipt, path, user_key=None):
             ok = True
         except InvalidSignature:
             ok = False
+        ex("ed25519 verify(sig, str(%s)) → %s" % (ih_field, "VALID" if ok else "INVALID"))
+        ex("airlock: %s external sockets recorded during the run"
+           % (ext if ext is not None else "not recorded"))
     except Exception:
-        print(panel([c("cryptography not installed — can't check the signature here.", "amber"),
-                     c("  pip install cryptography, then re-run.", "slate")], title="RAILCALL · verify", color="amber"))
+        print(panel([c("Can't check this signature — the `cryptography` package isn't importable here.", "amber"),
+                     c("  Install it, then re-run the exact same verify:", "slate"),
+                     c("  python3 -m pip install --user --break-system-packages cryptography", "cyan"),
+                     c("  railcall verify " + os.path.basename(path), "cyan")],
+                    title="RAILCALL · verify", color="amber"))
         print(footer(ok=False)); return 1
     lines = [c("receipt", "dim") + "   " + os.path.basename(path) + c("   " + str(receipt.get("schema", "")), "slate"),
              c("signer", "dim") + "    " + str(alg) + c("  key_id " + str(key_id), "slate"), ""]
@@ -925,8 +1259,17 @@ def cmd_verify(args):
     nested 'signature' block signing the integrity_hash / integrity / integrity_root STRING, checked
     against this install's pinned key). --key <path> verifies against an explicit, user-supplied
     signing_pubkey.json instead (for third-party auditors) — the output attributes that trust.
-    usage: railcall verify [receipt.json] [--key <signing_pubkey.json | dir>]"""
+    --explain traces every check performed (which integrity field was read, key_id matched vs
+    pinned, signature valid/invalid, airlock socket count) so verification is legible, not magic.
+    usage: railcall verify [receipt.json] [--key <signing_pubkey.json | dir>] [--explain]"""
     args = list(args)
+    explain = "--explain" in args
+    if explain:
+        args = [a for a in args if a != "--explain"]
+
+    def ex(msg):
+        if explain:
+            print(c("  · " + msg, "dim"))
     user_key = None     # (doc, path) — explicit, clearly-attributed trust; never implicit
     if "--key" in args:
         i = args.index("--key")
@@ -946,8 +1289,32 @@ def cmd_verify(args):
                          c("  " + str(e), "slate")], title="RAILCALL · verify", color="amber"))
             print(footer(ok=False)); return 1
         user_key = (kd, kp)
-    # default to the most recent audit receipt so `railcall verify` (no arg) just works
-    path = args[0] if args else os.path.join(d.ROOT, "railcall_audit_receipt.json")
+    # default to the most recent audit receipt or Studio/workflow receipt so `railcall verify` (no arg) just works
+    if args:
+        path = args[0]
+    else:
+        candidate_paths = [
+            RECEIPTS_DIR,
+            os.path.join(RECEIPTS_DIR, "runs"),
+            os.path.join(RECEIPTS_DIR, "capoff"),
+            os.path.join(os.path.dirname(RECEIPTS_DIR), "flow_receipts"),
+            os.path.join(os.path.dirname(RECEIPTS_DIR), "batch_receipts"),
+            getattr(d, "ROOT", os.path.join(os.path.expanduser("~"), ".railcall"))
+        ]
+        latest_file, latest_time = None, 0.0
+        for dir_path in candidate_paths:
+            try:
+                if os.path.isdir(dir_path):
+                    for f in os.listdir(dir_path):
+                        if f.endswith(".json"):
+                            full_path = os.path.join(dir_path, f)
+                            mtime = os.path.getmtime(full_path)
+                            if mtime > latest_time:
+                                latest_file = full_path
+                                latest_time = mtime
+            except OSError:
+                pass
+        path = latest_file if latest_file else os.path.join(d.ROOT, "railcall_audit_receipt.json")
     if not os.path.exists(path):
         msg = ([c("No receipt to verify yet.", "amber"), c("  Mint one first:  railcall audit <file.csv>", "slate")]
                if not args else [c("Receipt not found:", "amber"), c("  " + path, "slate")])
@@ -958,8 +1325,14 @@ def cmd_verify(args):
         if not isinstance(receipt, dict):
             raise ValueError("expected a JSON object")
     except Exception as e:
-        print(panel([c("Not a valid receipt (JSON object expected):", "amber"), c("  " + str(e), "slate")], title="RAILCALL · verify", color="amber"))
+        print(panel([c("This file isn't a readable RailCall receipt.", "amber"),
+                     c("  " + path, "slate"),
+                     c("  Parser said: " + str(e), "slate"),
+                     c("  It may be truncated, hand-edited, or not JSON. Mint a fresh one with", "slate"),
+                     c("    railcall audit <file.csv>    (or  railcall demo  for a sample receipt)", "cyan")],
+                    title="RAILCALL · verify", color="amber"))
         print(footer(ok=False)); return 1
+    ex("loaded %s (schema %s)" % (os.path.basename(path), receipt.get("schema", "?")))
     # Studio/workflow receipts nest the signature under a "signature" block and sign the integrity
     # field STRING: integrity_hash (Studio builds), integrity (Studio runs), or integrity_root
     # (workflow receipts). Route ALL of them to the dedicated verifier — falling through would
@@ -967,11 +1340,15 @@ def cmd_verify(args):
     _sb = receipt.get("signature")
     if isinstance(_sb, dict) and _sb.get("sig") and any(
             receipt.get(k) for k in ("integrity_hash", "integrity", "integrity_root")):
-        return _verify_studio_receipt(receipt, path, user_key=user_key)
+        ex("shape: nested-signature (Studio/workflow receipt) → studio verifier")
+        return _verify_studio_receipt(receipt, path, user_key=user_key, explain=explain)
+    ex("shape: flat signature_hex over the canonical body (CLI-audit receipt)")
     sig = receipt.get("signature_hex"); pub = receipt.get("public_key_hex"); alg = receipt.get("signer_alg")
     key_src = None
     if user_key is not None:    # explicit trust: check against the user's key, not the receipt's own
         pub, key_src = user_key[0]["public_key_hex"], user_key[1]
+    ex("trust key source: %s" % ("--key %s (user-supplied)" % key_src if key_src
+                                 else "the receipt's own embedded public_key_hex"))
     if not sig or not pub:
         print(panel([c("UNSIGNED receipt — nothing to verify.", "amber"),
                      c("  Minted without a signing key. Install cryptography, re-run the audit/build,", "slate"),
@@ -983,14 +1360,21 @@ def cmd_verify(args):
     except Exception:
         _rs = getattr(d, "receipt_signer", None)
     if _rs is None:
-        print(panel([c("cryptography not installed — can't check the signature here.", "amber"),
-                     c("  pip install cryptography, then re-run: railcall verify " + os.path.basename(path), "slate")],
+        print(panel([c("Can't check this signature — the `cryptography` package isn't importable here.", "amber"),
+                     c("  Install it, then re-run the exact same verify:", "slate"),
+                     c("  python3 -m pip install --user --break-system-packages cryptography", "cyan"),
+                     c("  railcall verify " + os.path.basename(path), "cyan")],
                     title="RAILCALL · verify", color="amber"))
         print(footer(ok=False)); return 1
     body = {k: v for k, v in receipt.items() if k not in ("signer_alg", "public_key_hex", "signature_hex")}
+    ex("public key %s… · integrity: %s over the canonical body (%d fields)"
+       % (pub[:16], alg or "ed25519", len(body)))
     ok = _rs.verify_payload(body, sig, pub)
     net = receipt.get("network_audit") or {}
     ext = net.get("external_sockets_open")
+    ex("signature verify → %s" % ("VALID" if ok else "INVALID"))
+    ex("airlock: %s external sockets recorded during the run"
+       % (ext if ext is not None else "not recorded"))
     lines = [c("receipt", "dim") + "   " + os.path.basename(path) + c("   " + str(receipt.get("schema", "")), "slate"),
              c("signer", "dim") + "    " + str(alg or "ed25519") + c("  pub " + pub[:16] + "…", "slate"), ""]
     if ok:
@@ -1240,16 +1624,252 @@ def cmd_restore(args):
     return 0
 
 
-_RECEIPTS_DIR = os.path.join(getattr(d, "ROOT", os.path.expanduser("~/.railcall")), "receipts")
+# ── railcall rotate-key: rotate the local Ed25519 signing keypair ─────────────
+# The PRIVATE signing seed lives in the 0600 vault (keys.local.json) the daemon signs every
+# receipt with; signing_pubkey.json is its PUBLIC half, published so any receipt verifies
+# offline. Rotation mints a fresh keypair, republishes the public doc under a NEW key_id, and
+# ARCHIVES the outgoing public doc to signing_pubkey.prev-<ts>.json so receipts signed BEFORE
+# the rotation still verify (pass the archived doc to `verify --key`). On-disk receipts are
+# untouched: flat CLI receipts embed their own public key; Studio receipts carry a key_id that
+# verify already matches against the archived doc.
+
+def _keys_workspace():
+    """The workspace dir where the PUBLIC signing_pubkey.json is published (same dirs `verify`
+    searches via _install_pubkey). Honors RAILCALL_WS; else the install ROOT's .railcall_workspace."""
+    env = os.environ.get("RAILCALL_WS")
+    if env:
+        return env
+    return os.path.join(getattr(d, "ROOT", os.path.expanduser("~/.railcall")), ".railcall_workspace")
+
+
+def _vault_file():
+    """The 0600 private-key vault the daemon signer actually reads (ROOT/keys.local.json). Rotating
+    the seed HERE is what makes new build/audit/demo receipts sign with the fresh key."""
+    return os.path.join(getattr(d, "ROOT", os.path.expanduser("~/.railcall")), "keys.local.json")
+
+
+def _write_pubkey_doc(ws, doc):
+    """Atomically publish the PUBLIC signing_pubkey.json (world-readable is fine — it's the verify key)."""
+    os.makedirs(ws, exist_ok=True)
+    path = os.path.join(ws, "signing_pubkey.json")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+    return path
+
+
+def _persist_signing_seed(seed_hex):
+    """Write the new private seed into the 0600 vault, PRESERVING every other vault key. Prefers
+    vault_io (temp -> fsync -> os.replace, 0600); falls back to a stdlib atomic 0600 write. Never
+    logs the seed."""
+    vault_path = _vault_file()
+    try:
+        import vault_io as _v
+    except Exception:
+        _v = getattr(d, "vault_io", None)
+    if _v is not None:
+        _v.update(vault_path, lambda cur: cur.update({"_railcall_signing_seed": seed_hex}))
+        return vault_path
+    # stdlib atomic fallback — still 0600, still preserves any other keys already in the vault
+    try:
+        with open(vault_path, encoding="utf-8") as f:
+            cur = json.load(f)
+        if not isinstance(cur, dict):
+            cur = {}
+    except Exception:
+        cur = {}
+    cur["_railcall_signing_seed"] = seed_hex
+    os.makedirs(os.path.dirname(vault_path), exist_ok=True)
+    tmp = vault_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cur, f, indent=2)
+    os.chmod(tmp, 0o600)            # secret is never even briefly world-readable
+    os.replace(tmp, vault_path)
+    os.chmod(vault_path, 0o600)
+    return vault_path
+
+
+def cmd_rotate_key(_=None):
+    """Rotate the local Ed25519 signing keypair: mint a fresh key, publish the new signing_pubkey.json
+    (new key_id), archive the OLD public doc to signing_pubkey.prev-<ts>.json, and store the new private
+    seed in the 0600 vault. Receipts signed BEFORE rotation still verify against the archived key. Fails
+    closed (writes nothing) if `cryptography` is missing. usage: railcall rotate-key"""
+    # fail closed: no signer -> no honest rotation. Never publish a public key no seed can sign for.
+    try:
+        import receipt_signer as _rs
+    except Exception:
+        _rs = getattr(d, "receipt_signer", None)
+    if _rs is None:
+        print(panel([c("Can't rotate — the `cryptography` package isn't importable here.", "amber"),
+                     c("  Rotation must mint a REAL keypair, so it fails closed rather than write a", "slate"),
+                     c("  public key no signature could match. Install it, then re-run:", "slate"),
+                     c("  python3 -m pip install --user --break-system-packages cryptography", "cyan"),
+                     c("  railcall rotate-key", "cyan")],
+                    title="RAILCALL · rotate-key", color="amber"))
+        print(footer(ok=False)); return 1
+
+    ws = _keys_workspace()
+    old_path = os.path.join(ws, "signing_pubkey.json")
+    old_doc = None
+    if os.path.exists(old_path):
+        try:
+            old_doc = json.loads(open(old_path, encoding="utf-8").read())
+        except Exception:
+            old_doc = None      # unreadable current doc -> treat as first publish, don't archive garbage
+
+    # mint the fresh keypair — 32 random bytes IS a full Ed25519 seed (stdlib os.urandom)
+    try:
+        new_seed = os.urandom(32).hex()
+        new_pub = _rs.public_key_hex(new_seed)          # proves the signer accepts the seed before we commit
+    except Exception as e:
+        print(panel([c("Key generation failed — nothing was changed.", "red"),
+                     c("  " + str(e), "slate")], title="RAILCALL · rotate-key", color="red"))
+        print(footer(ok=False)); return 1
+    new_key_id = hashlib.sha256(bytes.fromhex(new_pub)).hexdigest()[:16]   # same id convention as the signer
+
+    # archive the outgoing PUBLIC doc FIRST so pre-rotation receipts stay verifiable (verify --key <archived>)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    archived = None
+    if old_doc is not None:
+        archived = os.path.join(ws, "signing_pubkey.prev-%s.json" % stamp)
+        try:
+            with open(archived, "w", encoding="utf-8") as f:
+                json.dump(old_doc, f, indent=2); f.write("\n")
+        except Exception as e:
+            print(panel([c("Refusing to rotate — couldn't archive the current public key first.", "red"),
+                         c("  " + str(e), "slate"),
+                         c("  Rotating without an archive would strand receipts signed by the old key.", "slate")],
+                        title="RAILCALL · rotate-key", color="red"))
+            print(footer(ok=False)); return 1
+
+    # publish the new PUBLIC doc, then persist the new PRIVATE seed to the 0600 vault
+    new_doc = {
+        "schema": "railcall_signing_pubkey.v1",
+        "alg": "ed25519",
+        "public_key_hex": new_pub,
+        "key_id": new_key_id,
+        "rotated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "note": ("Ed25519 PUBLIC key for this RailCall install. Receipt signatures verify against THIS key. "
+                 "Safe to publish; the matching private seed never leaves the 0600 vault."),
+    }
+    try:
+        pub_path = _write_pubkey_doc(ws, new_doc)
+        vault_path = _persist_signing_seed(new_seed)
+    except Exception as e:
+        print(panel([c("Rotation failed while writing the new key — check permissions on", "red"),
+                     c("  " + ws, "slate"), c("  " + str(e), "slate")],
+                    title="RAILCALL · rotate-key", color="red"))
+        print(footer(ok=False)); return 1
+
+    old_id = (old_doc or {}).get("key_id")
+    lines = [
+        c("✓ rotated signing key", "green") + c("   new key_id " + new_key_id, "slate"),
+        "",
+        c("new public key", "dim") + "   " + pub_path,
+        c("private seed  ", "dim") + "   " + vault_path + c("  (0600, never published)", "dim"),
+    ]
+    if archived:
+        lines.append(c("archived old  ", "dim") + "   " + archived +
+                     (c("  key_id " + str(old_id), "slate") if old_id else ""))
+        lines.append("")
+        lines.append(c("Receipts signed BEFORE now were signed by the old key — they still verify.", "slate"))
+        lines.append(c("Flat CLI receipts carry their own key; for a Studio receipt point verify at the archive:", "slate"))
+        lines.append(c("  railcall verify <receipt.json> --key " + archived, "cyan"))
+    else:
+        lines.append("")
+        lines.append(c("No previous public key was on disk — this is the first published key.", "slate"))
+    lines.append("")
+    lines.append(c("From now on, new receipts are signed by " + new_key_id + ".", "dim"))
+    print(panel(lines, title="RAILCALL · rotate-key", color="cyan"))
+    print(footer(ok=True, label="Rotated"))
+    return 0
+
+
+# ── railcall demo: the 30-second golden path (build -> signed receipt -> verify) ──
+# One command a brand-new user runs to watch the whole promise work, entirely locally: it builds a
+# tiny bundled sample workflow (watch a folder for CSVs, dedup rows, write a local summary — DRY-RUN),
+# mints a REAL Ed25519-signed receipt, then verifies it OFFLINE. No network, no sends, no daemon, no
+# Ollama. The receipt is a FLAT CLI receipt (embeds its own public key), so `verify` re-checks it
+# against the receipt itself — nothing about this needs install state or a server.
+_DEMO_SAMPLE_CSV = (
+    "order_id,customer,amount\n"
+    "1001,acme,42.00\n"
+    "1002,globex,17.50\n"
+    "1001,acme,42.00\n"        # exact duplicate of the first data row
+    "1003,initech,88.25\n"
+    "1002,globex,17.50\n"      # exact duplicate of the second data row
+)
+
+
+def cmd_demo(_=None):
+    """The 30-second golden path — build a tiny sample workflow locally (watch a folder for CSVs, dedup
+    rows, write a local summary — DRY-RUN), mint a REAL signed receipt, and verify it offline. No network,
+    no sends. usage: railcall demo"""
+    # dedup the bundled sample by whole-row (the workflow's core step), all in memory
+    rows = [ln for ln in _DEMO_SAMPLE_CSV.split("\n") if ln.strip()]
+    body = rows[1:]
+    seen, unique = set(), []
+    for r in body:
+        if r not in seen:
+            seen.add(r); unique.append(r)
+    dupes = len(body) - len(unique)
+    summary = ("watch-folder-dedup-summary: %d rows in, %d unique, %d duplicate rows removed"
+               % (len(body), len(unique), dupes))
+
+    # the receipt is a FLAT CLI receipt: it embeds its own public key, so `verify` re-checks it against
+    # the receipt itself — no install state needed. network_audit is MEASURED via lsof, never asserted.
+    net = d.lsof_socket_audit()
+    receipt = {
+        "schema": "railcall_demo_receipt.v1",
+        "ran_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "workflow": {
+            "name": "watch-folder-dedup-summary",
+            "steps": ["watch <folder> for new *.csv",
+                      "dedup rows (drop exact-duplicate lines)",
+                      "write a local summary.txt"],
+            "mode": "dry-run",       # nothing is watched / sent / executed — this demos the SHAPE, safely
+        },
+        "sample": {"rows_in": len(body), "unique_rows": len(unique),
+                   "duplicates_removed": dupes, "summary": summary},
+        "input_sha256": "sha256:" + d.sha256_hex(_DEMO_SAMPLE_CSV),
+        "network_audit": net,        # MEASURED, not asserted
+        "result": "dry_run_ok",
+    }
+    d._sign_receipt(receipt)         # REAL Ed25519 if a key is vaulted; honestly UNSIGNED otherwise
+    demo_path = os.path.join(d.ROOT, "railcall_demo_receipt.json")
+    d._save_receipt(demo_path, receipt)
+
+    ext = net.get("external_sockets_open")
+    lines = [
+        c("1 · build", "dim") + "   " + c("watch-folder-dedup-summary", "cyan") + c("  (dry-run — nothing sent)", "slate"),
+        c("2 · dedup", "dim") + "   " + c(summary, "slate"),
+        "",
+        (c("airlock ✓", "green") if ext == 0 else c("airlock ?", "amber")) +
+        c("   %s external sockets · ran entirely on this machine" % (ext if ext is not None else "?"), "slate"),
+        c("3 · receipt", "dim") + " " + demo_path,
+    ]
+    if not receipt.get("signature_hex"):
+        # honest: the golden path's payoff is a REAL signature; without cryptography there isn't one to verify
+        lines.append("")
+        lines.append(c("⚠ receipt minted UNSIGNED — `cryptography` isn't installed, so there's no", "amber"))
+        lines.append(c("  signature to verify. Install it to see the full proof, then re-run demo:", "slate"))
+        lines.append(c("  python3 -m pip install --user --break-system-packages cryptography", "cyan"))
+        print(panel(lines, title="RAILCALL · demo", color="amber"))
+        print(footer(ok=False, label="Unsigned (install cryptography)"))
+        return 1
+    lines.append(c("           signed ed25519 · pub " + str(receipt.get("public_key_hex", ""))[:16] + "…", "dim"))
+    print(panel(lines, title="RAILCALL · demo", color="cyan"))
+    # 4 · verify the receipt we JUST minted, OFFLINE — reuse the real verifier so this is proof, not a mock
+    print(c("4 · verify (offline, no network)…", "dim"))
+    return cmd_verify([demo_path])
 
 
 def cmd_receipts(args):
-    """Browse the signed receipt history — timestamped, never overwritten.
-    usage: railcall receipts [list] [-n N]
-
-    Bug 33 fix: the verify hint now uses the full absolute path so the suggested
-    command works from any working directory, not just ~/.railcall.
-    """
+    """Browse the receipt history (community: Sami, bugs 20/27). Every governed run keeps a timestamped
+    copy under receipts/ so a later run never destroys an earlier proof — the canonical fixed-name file is
+    always the latest; this is the full trail. usage: railcall receipts [list] [-n N]"""
     sub = args[0] if args and not args[0].startswith("-") else "list"
     if sub not in ("list", "ls"):
         print(footer(ok=False, label="usage: railcall receipts list [-n N]")); return 1
@@ -1259,29 +1879,57 @@ def cmd_receipts(args):
             limit = max(1, int(args[args.index("-n") + 1]))
         except (ValueError, IndexError):
             pass
-    try:
-        files = [f for f in os.listdir(_RECEIPTS_DIR) if f.endswith(".json")]
-    except (FileNotFoundError, OSError):
-        files = []
-    if not files:
+
+    # Collect receipts from all possible CLI and Studio paths to bridge the workspace split
+    candidate_paths = []
+    candidate_paths.append((RECEIPTS_DIR, ""))
+    candidate_paths.append((os.path.join(RECEIPTS_DIR, "runs"), "runs"))
+    candidate_paths.append((os.path.join(RECEIPTS_DIR, "capoff"), "capoff"))
+    ws_parent = os.path.dirname(RECEIPTS_DIR)
+    candidate_paths.append((os.path.join(ws_parent, "flow_receipts"), "flow_receipts"))
+    candidate_paths.append((os.path.join(ws_parent, "batch_receipts"), "batch_receipts"))
+    legacy_dir = os.path.join(getattr(d, "ROOT", os.path.join(os.path.expanduser("~"), ".railcall")), "receipts")
+    if legacy_dir != RECEIPTS_DIR:
+        candidate_paths.append((legacy_dir, ""))
+
+    files_info = []
+    for path, category in candidate_paths:
+        try:
+            if os.path.isdir(path):
+                for f in os.listdir(path):
+                    if f.endswith(".json") and not f.startswith("."):
+                        full_path = os.path.join(path, f)
+                        if os.path.isfile(full_path):
+                            files_info.append({
+                                "filename": f,
+                                "full_path": full_path,
+                                "category": category
+                            })
+        except OSError:
+            pass
+
+    if not files_info:
         print(panel([c("No receipt history yet.", "amber"),
                      c("  Run 'railcall build', 'railcall audit <csv>', or 'railcall interpret' —", "slate"),
                      c("  each keeps a timestamped, verifiable copy under:", "slate"),
-                     c("  " + _RECEIPTS_DIR, "dim")], title="RAILCALL · receipts", color="amber"))
+                     c("  " + RECEIPTS_DIR, "dim")], title="RAILCALL · receipts", color="amber"))
         print(footer(ok=True, label="0 receipts")); return 0
 
-    def _mtime(fn):
+    def _mtime(info):
         try:
-            return os.path.getmtime(os.path.join(_RECEIPTS_DIR, fn))
+            return os.path.getmtime(info["full_path"])
         except OSError:
             return 0.0
-    files.sort(key=_mtime, reverse=True)
-    shown = files[:limit]
-    lines = [c("history", "dim") + "   " + _RECEIPTS_DIR, ""]
-    for fn in shown:
+    files_info.sort(key=_mtime, reverse=True)
+    shown = files_info[:limit]
+    lines = [c("history", "dim") + "   " + RECEIPTS_DIR, ""]
+    for info in shown:
+        fn = info["filename"]
+        fp = info["full_path"]
+        cat_prefix = (info["category"] + "/") if info["category"] else ""
         schema, signed, result = "", "unsigned", ""
         try:
-            r = json.loads(open(os.path.join(_RECEIPTS_DIR, fn), encoding="utf-8").read())
+            r = json.loads(open(fp, encoding="utf-8").read())
             schema = r.get("schema") or ""
             signed = ("ed25519-signed" if (r.get("signature_hex") or
                       (isinstance(r.get("signature"), dict) and r["signature"].get("signature"))) else "unsigned")
@@ -1289,29 +1937,35 @@ def cmd_receipts(args):
         except Exception:
             pass
         badge = c("✓", "green") if signed.startswith("ed25519") else c("○", "slate")
-        lines.append(badge + " " + c(fn, "cyan"))
+        lines.append(badge + " " + c(cat_prefix + fn, "cyan"))
         lines.append(c("   " + schema + (("  · " + str(result)) if result else "") + "  · " + signed, "slate"))
-    if len(files) > len(shown):
+    if len(files_info) > len(shown):
         lines.append("")
-        lines.append(c("  … %d more (railcall receipts list -n %d)" % (len(files) - len(shown), len(files)), "dim"))
+        lines.append(c("  … %d more (railcall receipts list -n %d)" % (len(files_info) - len(shown), len(files_info)), "dim"))
     lines.append("")
     lines.append(c("verify any of them offline:", "dim"))
-    # Bug 33: use absolute path so the hint works from any working directory
-    lines.append(c("  railcall verify " + os.path.join(_RECEIPTS_DIR, shown[0]), "cyan"))
-    print(panel(lines, title="RAILCALL · receipt history (%d)" % len(files), color="cyan"))
-    print(footer(ok=True, label="%d receipt%s" % (len(files), "" if len(files) == 1 else "s")))
+    lines.append(c("  railcall verify " + shown[0]["full_path"], "cyan"))
+    print(panel(lines, title="RAILCALL · receipt history (%d)" % len(files_info), color="cyan"))
+    print(footer(ok=True, label="%d receipt%s" % (len(files_info), "" if len(files_info) == 1 else "s")))
     return 0
 
 
 COMMANDS = {"build": cmd_build, "interpret": cmd_interpret, "daemon": cmd_daemon,
             "start-daemon": cmd_daemon, "health": cmd_health, "dashboard": cmd_dashboard,
+            "doctor": cmd_doctor, "demo": cmd_demo, "rotate-key": cmd_rotate_key,
             "balance": cmd_balance, "login": cmd_login, "studio": cmd_studio, "audit": cmd_audit,
-            "verify": cmd_verify, "backup": cmd_backup, "restore": cmd_restore,
-            "backup-verify": cmd_backup_verify, "receipts": cmd_receipts}
+            "verify": cmd_verify, "receipts": cmd_receipts, "backup": cmd_backup, "restore": cmd_restore,
+            "backup-verify": cmd_backup_verify}
 
 
 def main():
     if len(sys.argv) < 2:
+        return cmd_dashboard()
+    arg1 = sys.argv[1].lower()
+    if arg1 in ("--version", "-v", "version"):
+        print("railcall version v0.2.0")
+        return 0
+    if arg1 in ("--help", "-h", "help"):
         return cmd_dashboard()
     fn = COMMANDS.get(sys.argv[1])
     if not fn:
