@@ -7,7 +7,7 @@ fail=0
 
 echo "== 1. Python sources compile =="
 if $PY -m py_compile "$ROOT/cli/railcall_cli.py" "$ROOT/railcall_verify_standalone.py" \
-        "$ROOT/qa/test_tamper_fuzz.py" "$ROOT/qa/test_e2e_golden_path.py" \
+        "$ROOT/qa/test_tamper_fuzz.py" "$ROOT/qa/test_e2e_golden_path.py" "$ROOT/qa/test_formula_injection.py" \
         "$ROOT/vault/vault.py" "$ROOT/discord-bot/bot.py" "$ROOT/qa/test_vault.py"; then echo "  ok"; else echo "  FAIL"; fail=1; fi
 
 echo "== 2. install.sh parses =="
@@ -22,6 +22,9 @@ if ( cd "$ROOT/qa" && $PY -m unittest test_regressions -v ); then echo "  ok"; e
 
 echo "== 4b. Vault test suite =="
 if ( cd "$ROOT/qa" && $PY -m unittest test_vault -v ); then echo "  ok"; else echo "  FAIL"; fail=1; fi
+
+echo "== 4c. Formula injection (Bug 13 vectors - now present, expand assertions) =="
+if ( cd "$ROOT/qa" && $PY -m unittest test_formula_injection -v ); then echo "  ok"; else echo "  FAIL"; fail=1; fi
 
 echo "== 5. tamper-fuzz the standalone verifier (thousands of mutations, none may verify) =="
 if ( cd "$ROOT/qa" && $PY -m unittest test_tamper_fuzz -v ); then echo "  ok"; else echo "  FAIL"; fail=1; fi
