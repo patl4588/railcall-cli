@@ -265,6 +265,34 @@ if ($parts -notcontains $RcBin) {
 # Make 'railcall' resolvable in THIS session too, without reopening the terminal.
 if (@(($env:Path).Split(';')) -notcontains $RcBin) { $env:Path = "$($env:Path);$RcBin" }
 
+# Also append to Git Bash / MinGW environment files if they exist or if Git Bash is installed,
+# ensuring shell environment PATH persistence.
+$UserProfile = $env:USERPROFILE
+$Bashrc = Join-Path $UserProfile '.bashrc'
+$BashProfile = Join-Path $UserProfile '.bash_profile'
+
+if ((Test-Path $Bashrc) -or (Test-Path $BashProfile) -or (Get-Command git -ErrorAction SilentlyContinue)) {
+    if (-not (Test-Path $Bashrc)) {
+        New-Item -ItemType File -Path $Bashrc -Force | Out-Null
+    }
+    $bashrcContent = [IO.File]::ReadAllText($Bashrc)
+    $rcBinPosix = $RcBin.Replace('\', '/').Replace('C:', '/c').Replace('c:', '/c')
+    if ($bashrcContent -notlike "*$RcBin*" -and $bashrcContent -notlike "*$rcBinPosix*") {
+        $RcBinEscaped = $rcBinPosix.Replace(' ', '\ ')
+        $BashLine = "`n# Added by Railcall installer`nexport PATH=`"`$PATH:$RcBinEscaped`"`n"
+        Add-Content -Path $Bashrc -Value $BashLine
+        Write-C "Added $RcBin to PATH in $Bashrc (for Git Bash / MinGW)." Green
+    }
+    if (-not (Test-Path $BashProfile)) {
+        "# Git Bash default`n" | Set-Content -Path $BashProfile -Encoding ascii
+    }
+    $profileContent = [IO.File]::ReadAllText($BashProfile)
+    if ($profileContent -notlike "*source ~/.bashrc*" -and $profileContent -notlike "*. ~/.bashrc*") {
+        $SourceLine = "`nif [ -f ~/.bashrc ]; then . ~/.bashrc; fi`n"
+        Add-Content -Path $BashProfile -Value $SourceLine
+    }
+}
+
 # ---- Done -----------------------------------------------------------------------------------------
 Write-C "Installed. LOCAL - BYOK - DRY-RUN - NO SENDS - everything runs on 127.0.0.1, nothing fires without your approval." Green
 Write-C "================================================================" Cyan

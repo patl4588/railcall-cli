@@ -87,8 +87,15 @@ def write_token(token):
 # A governed run must never destroy the proof of the last one, and every run should leave an append-only
 # trail. Both live NEXT TO the canonical receipts in the daemon ROOT. Both are BEST-EFFORT — a history or
 # log failure is swallowed and can NEVER break or fail a real run.
-RECEIPTS_DIR = os.path.join(getattr(d, "ROOT", os.path.expanduser("~")), "receipts")
-AUDIT_LOG_PATH = os.path.join(getattr(d, "ROOT", os.path.expanduser("~")), "audit_log.jsonl")
+# Unify workspace paths between CLI and Studio (Finding 01 / community feedback)
+_home = os.path.expanduser("~")
+_station_workspace = os.path.join(_home, ".railcall", "station", ".railcall_workspace")
+if os.path.isdir(_station_workspace):
+    RECEIPTS_DIR = os.path.join(_station_workspace, "receipts")
+    AUDIT_LOG_PATH = os.path.join(_station_workspace, "audit_log.jsonl")
+else:
+    RECEIPTS_DIR = os.path.join(getattr(d, "ROOT", os.path.join(_home, ".railcall")), "receipts")
+    AUDIT_LOG_PATH = os.path.join(getattr(d, "ROOT", os.path.join(_home, ".railcall")), "audit_log.jsonl")
 
 
 def _receipt_key_id(receipt):
@@ -744,21 +751,26 @@ def cmd_doctor(_=None):
             "python3 -m pip install --user --break-system-packages cryptography")
 
     # Ollama (only `railcall interpret` needs it) + which model is actually installed
+    env_model = os.environ.get("RAILCALL_OLLAMA_MODEL")
     tags_url = d.OLLAMA_URL.rsplit("/api/", 1)[0] + "/api/tags"
     try:
         with urllib.request.urlopen(tags_url, timeout=2) as r:
             models = [m.get("name") for m in json.loads(r.read().decode("utf-8")).get("models", [])
                       if m.get("name")]
-        if not models:
+        if env_model:
+            if env_model in models:
+                rec("PASS", "Ollama reachable on :11434 · custom model %s installed (via RAILCALL_OLLAMA_MODEL)" % env_model)
+            else:
+                rec("WARN", "Ollama reachable but custom model %s NOT installed (via RAILCALL_OLLAMA_MODEL)" % env_model,
+                    "ollama pull " + env_model)
+        elif not models:
             rec("WARN", "Ollama reachable on :11434 but NO models installed (interpret needs one)",
                 "ollama pull " + d.OLLAMA_MODEL)
         elif d.OLLAMA_MODEL in models:
             rec("PASS", "Ollama reachable on :11434 · default model %s installed" % d.OLLAMA_MODEL)
         else:
-            rec("WARN", "Ollama reachable but default %s NOT installed (have: %s)"
-                % (d.OLLAMA_MODEL, ", ".join(models[:4])),
-                "ollama pull %s   (or run interpret with RAILCALL_OLLAMA_MODEL=%s)"
-                % (d.OLLAMA_MODEL, models[0]))
+            rec("PASS", "Ollama reachable on :11434 · using auto-detected model %s (default %s not installed)"
+                % (models[0], d.OLLAMA_MODEL))
     except Exception:
         rec("WARN", "Ollama not reachable on 127.0.0.1:11434 (only 'railcall interpret' needs it)",
             "start it (ollama serve) then: ollama pull " + d.OLLAMA_MODEL)
@@ -1277,8 +1289,32 @@ def cmd_verify(args):
                          c("  " + str(e), "slate")], title="RAILCALL · verify", color="amber"))
             print(footer(ok=False)); return 1
         user_key = (kd, kp)
-    # default to the most recent audit receipt so `railcall verify` (no arg) just works
-    path = args[0] if args else os.path.join(d.ROOT, "railcall_audit_receipt.json")
+    # default to the most recent audit receipt or Studio/workflow receipt so `railcall verify` (no arg) just works
+    if args:
+        path = args[0]
+    else:
+        candidate_paths = [
+            RECEIPTS_DIR,
+            os.path.join(RECEIPTS_DIR, "runs"),
+            os.path.join(RECEIPTS_DIR, "capoff"),
+            os.path.join(os.path.dirname(RECEIPTS_DIR), "flow_receipts"),
+            os.path.join(os.path.dirname(RECEIPTS_DIR), "batch_receipts"),
+            getattr(d, "ROOT", os.path.join(os.path.expanduser("~"), ".railcall"))
+        ]
+        latest_file, latest_time = None, 0.0
+        for dir_path in candidate_paths:
+            try:
+                if os.path.isdir(dir_path):
+                    for f in os.listdir(dir_path):
+                        if f.endswith(".json"):
+                            full_path = os.path.join(dir_path, f)
+                            mtime = os.path.getmtime(full_path)
+                            if mtime > latest_time:
+                                latest_file = full_path
+                                latest_time = mtime
+            except OSError:
+                pass
+        path = latest_file if latest_file else os.path.join(d.ROOT, "railcall_audit_receipt.json")
     if not os.path.exists(path):
         msg = ([c("No receipt to verify yet.", "amber"), c("  Mint one first:  railcall audit <file.csv>", "slate")]
                if not args else [c("Receipt not found:", "amber"), c("  " + path, "slate")])
@@ -1843,30 +1879,57 @@ def cmd_receipts(args):
             limit = max(1, int(args[args.index("-n") + 1]))
         except (ValueError, IndexError):
             pass
-    try:
-        files = [f for f in os.listdir(RECEIPTS_DIR) if f.endswith(".json")]
-    except (FileNotFoundError, OSError):
-        files = []
-    if not files:
+
+    # Collect receipts from all possible CLI and Studio paths to bridge the workspace split
+    candidate_paths = []
+    candidate_paths.append((RECEIPTS_DIR, ""))
+    candidate_paths.append((os.path.join(RECEIPTS_DIR, "runs"), "runs"))
+    candidate_paths.append((os.path.join(RECEIPTS_DIR, "capoff"), "capoff"))
+    ws_parent = os.path.dirname(RECEIPTS_DIR)
+    candidate_paths.append((os.path.join(ws_parent, "flow_receipts"), "flow_receipts"))
+    candidate_paths.append((os.path.join(ws_parent, "batch_receipts"), "batch_receipts"))
+    legacy_dir = os.path.join(getattr(d, "ROOT", os.path.join(os.path.expanduser("~"), ".railcall")), "receipts")
+    if legacy_dir != RECEIPTS_DIR:
+        candidate_paths.append((legacy_dir, ""))
+
+    files_info = []
+    for path, category in candidate_paths:
+        try:
+            if os.path.isdir(path):
+                for f in os.listdir(path):
+                    if f.endswith(".json") and not f.startswith("."):
+                        full_path = os.path.join(path, f)
+                        if os.path.isfile(full_path):
+                            files_info.append({
+                                "filename": f,
+                                "full_path": full_path,
+                                "category": category
+                            })
+        except OSError:
+            pass
+
+    if not files_info:
         print(panel([c("No receipt history yet.", "amber"),
                      c("  Run 'railcall build', 'railcall audit <csv>', or 'railcall interpret' —", "slate"),
                      c("  each keeps a timestamped, verifiable copy under:", "slate"),
                      c("  " + RECEIPTS_DIR, "dim")], title="RAILCALL · receipts", color="amber"))
         print(footer(ok=True, label="0 receipts")); return 0
-    # Newest first by WRITE TIME — not by filename: the name is <schema>-<UTC>, so a plain
-    # reverse string-sort would order by schema first and bury the genuinely-latest receipt.
-    def _mtime(fn):
+
+    def _mtime(info):
         try:
-            return os.path.getmtime(os.path.join(RECEIPTS_DIR, fn))
+            return os.path.getmtime(info["full_path"])
         except OSError:
             return 0.0
-    files.sort(key=_mtime, reverse=True)
-    shown = files[:limit]
+    files_info.sort(key=_mtime, reverse=True)
+    shown = files_info[:limit]
     lines = [c("history", "dim") + "   " + RECEIPTS_DIR, ""]
-    for fn in shown:
+    for info in shown:
+        fn = info["filename"]
+        fp = info["full_path"]
+        cat_prefix = (info["category"] + "/") if info["category"] else ""
         schema, signed, result = "", "unsigned", ""
         try:
-            r = json.loads(open(os.path.join(RECEIPTS_DIR, fn), encoding="utf-8").read())
+            r = json.loads(open(fp, encoding="utf-8").read())
             schema = r.get("schema") or ""
             signed = ("ed25519-signed" if (r.get("signature_hex") or
                       (isinstance(r.get("signature"), dict) and r["signature"].get("signature"))) else "unsigned")
@@ -1874,16 +1937,16 @@ def cmd_receipts(args):
         except Exception:
             pass
         badge = c("✓", "green") if signed.startswith("ed25519") else c("○", "slate")
-        lines.append(badge + " " + c(fn, "cyan"))
+        lines.append(badge + " " + c(cat_prefix + fn, "cyan"))
         lines.append(c("   " + schema + (("  · " + str(result)) if result else "") + "  · " + signed, "slate"))
-    if len(files) > len(shown):
+    if len(files_info) > len(shown):
         lines.append("")
-        lines.append(c("  … %d more (railcall receipts list -n %d)" % (len(files) - len(shown), len(files)), "dim"))
+        lines.append(c("  … %d more (railcall receipts list -n %d)" % (len(files_info) - len(shown), len(files_info)), "dim"))
     lines.append("")
     lines.append(c("verify any of them offline:", "dim"))
-    lines.append(c("  railcall verify " + os.path.join(RECEIPTS_DIR, shown[0]), "cyan"))
-    print(panel(lines, title="RAILCALL · receipt history (%d)" % len(files), color="cyan"))
-    print(footer(ok=True, label="%d receipt%s" % (len(files), "" if len(files) == 1 else "s")))
+    lines.append(c("  railcall verify " + shown[0]["full_path"], "cyan"))
+    print(panel(lines, title="RAILCALL · receipt history (%d)" % len(files_info), color="cyan"))
+    print(footer(ok=True, label="%d receipt%s" % (len(files_info), "" if len(files_info) == 1 else "s")))
     return 0
 
 
@@ -1897,6 +1960,12 @@ COMMANDS = {"build": cmd_build, "interpret": cmd_interpret, "daemon": cmd_daemon
 
 def main():
     if len(sys.argv) < 2:
+        return cmd_dashboard()
+    arg1 = sys.argv[1].lower()
+    if arg1 in ("--version", "-v", "version"):
+        print("railcall version v0.2.0")
+        return 0
+    if arg1 in ("--help", "-h", "help"):
         return cmd_dashboard()
     fn = COMMANDS.get(sys.argv[1])
     if not fn:
