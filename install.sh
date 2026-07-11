@@ -1,6 +1,7 @@
 #!/bin/bash
-# Railcall network installer.  Usage:
-#   curl -fsSL https://raw.githubusercontent.com/patl4588/railcall-core/main/install.sh | bash
+# Railcall network installer.  Usage (ships the full local Studio):
+#   curl -fsSL https://railcall.ai/install.sh | bash
+#   or direct: curl -fsSL https://raw.githubusercontent.com/patl4588/railcall-core/main/install.sh | bash
 set -euo pipefail
 
 CYAN='\033[0;36m'; GREEN='\033[0;32m'; BLUE='\033[0;34m'; RED='\033[0;31m'; NC='\033[0m'
@@ -170,8 +171,8 @@ else
     fi
 fi
 
-# ---- Studio (the visual builder) — fetch + unpack the station bundle (one-time, ~22MB) ----
-STATION_URL="https://github.com/patl4588/railcall-core/releases/download/station-v0.1/railcall_station.tar.gz"
+# ---- Studio (the visual builder v0.2) — fetch + unpack the station bundle (one-time, ~22MB) ----
+STATION_URL="https://github.com/patl4588/railcall-core/releases/download/station-v0.2/railcall_station.tar.gz"
 STATION_DIR="$RC_HOME/station"
 echo -e "${BLUE}Downloading the RailCall Studio (one-time, ~22MB) ...${NC}"
 if fetch "$STATION_URL" "$RC_HOME/station.tar.gz"; then
