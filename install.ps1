@@ -205,10 +205,10 @@ if (Test-Crypto) {
     }
 }
 
-# ---- Studio (the visual builder) - fetch + unpack the station bundle (one-time, ~22MB) ------------
+# ---- Studio (the visual builder v0.2) - fetch + unpack the station bundle (one-time, ~22MB) ------------
 # Best-effort + non-fatal, mirroring install.sh. 'tar' ships with Windows 10 1803+; without it the CLI
 # still works and this can be retried by re-running the installer.
-$StationUrl = 'https://github.com/patl4588/railcall-core/releases/download/station-v0.1/railcall_station.tar.gz'
+$StationUrl = 'https://github.com/patl4588/railcall-core/releases/download/station-v0.2/railcall_station.tar.gz'
 $StationDir = Join-Path $RcHome 'station'
 $StationTgz = Join-Path $RcHome 'station.tar.gz'
 Write-C "Downloading the RailCall Studio (one-time, ~22MB) ..." Blue
