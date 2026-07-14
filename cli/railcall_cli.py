@@ -28,6 +28,9 @@ install stays a 2-file curl|bash and the airlock metering is never touched by re
                                    (--key <signing_pubkey.json|dir> = verify against an explicit key)
   railcall rotate-key              mint a fresh Ed25519 signing keypair; archive the old public key
                                    (signing_pubkey.prev-<ts>.json) so pre-rotation receipts still verify
+  railcall send discord "<msg>"    send a message through the local Studio to the Discord webhook;
+                                   preview → confirm → receipt · logged to integration_audit.jsonl
+  railcall send slack "<msg>"      same, but to Slack (webhook must be configured in the vault)
 
 Paid runs (a saved rc_live_ key) are booked against the server-side prepaid balance via the
 gateway's /meter after each successful build/interpret; free-trial runs stay fully local.
@@ -701,6 +704,596 @@ def cmd_daemon(_=None):
         print(panel([c(f"could not bind {d.HOST}:{d.PORT}: {e}", "red")], title="RAILCALL · daemon", color="red"))
         return 1
     return 0
+
+
+def cmd_send(args):
+    """railcall send <discord|slack> [channel] "<message>"
+
+    Send through the local Studio. If [channel] is omitted, uses the vault's
+    default_channel for that integration, or the only configured channel if
+    there's just one. If multiple channels exist and no default is set, the
+    Studio refuses with a list of known channels — no silent broadcasts.
+
+    Examples:
+      railcall send slack "deploy done"                # default channel
+      railcall send slack deploys "deploy done"        # named channel
+      railcall send discord alerts "prod alert"
+    """
+    if len(args) < 2:
+        print(footer(ok=False, label='usage: railcall send <discord|slack> [channel] "<message>"'))
+        return 1
+    target = args[0].lower()
+    if target not in ("discord", "slack", "teams", "webhook", "gsheets", "gdocs", "telegram", "resend", "notion", "github"):
+        print(footer(ok=False, label=f"unknown target '{target}' — use discord, slack, teams, webhook, gsheets, gdocs, telegram, resend, notion, or github"))
+        return 1
+
+    # If args[1] looks like a channel name (single token, no spaces) AND args[2:] exists,
+    # treat it as a channel hint. Otherwise treat all remaining args as the message.
+    channel = None
+    message_start = 1
+    if len(args) >= 3 and re.match(r"^[A-Za-z0-9_-]+$", args[1]):
+        channel = args[1]
+        message_start = 2
+
+    # Pull optional --to / --subject / --body flags out of the tail
+    tail = args[message_start:]
+    to_addr = None
+    subject = None
+    issue_body = None
+    filtered = []
+    i = 0
+    while i < len(tail):
+        if tail[i] == "--to" and i + 1 < len(tail):
+            to_addr = tail[i + 1]; i += 2; continue
+        if tail[i] == "--subject" and i + 1 < len(tail):
+            subject = tail[i + 1]; i += 2; continue
+        if tail[i] == "--body" and i + 1 < len(tail):
+            issue_body = tail[i + 1]; i += 2; continue
+        filtered.append(tail[i]); i += 1
+    message = " ".join(filtered).strip().strip('"').strip("'")
+    if not message:
+        print(footer(ok=False, label="message cannot be empty"))
+        return 1
+
+    import urllib.request as _ur, urllib.error as _ue
+    # GitHub is title-based, not message-based; route to the issues endpoint
+    if target == "github":
+        url = "http://127.0.0.1:8799/api/github/issue"
+        body = {"title": message, "body": issue_body or ""}
+    else:
+        url = f"http://127.0.0.1:8799/api/{target}/send"
+        body = {"message": message}
+    if channel: body["channel"] = channel
+    if to_addr: body["to"] = to_addr
+    if subject: body["subject"] = subject
+    payload = json.dumps(body).encode("utf-8")
+    req = _ur.Request(
+        url, data=payload, method="POST",
+        headers={"Content-Type": "application/json", "User-Agent": "railcall-cli/1"},
+    )
+    try:
+        with _ur.urlopen(req, timeout=15) as r:
+            resp = json.loads(r.read().decode("utf-8"))
+    except _ue.HTTPError as e:
+        # Server responded with 4xx/5xx — read its JSON body for the real error
+        try:
+            resp = json.loads(e.read().decode("utf-8"))
+        except Exception:
+            print(footer(ok=False, label=f"HTTP {e.code}: {e.reason}"))
+            return 1
+        print(footer(ok=False, label=f"{target} send refused: {resp.get('error', f'HTTP {e.code}')}"))
+        return 1
+    except _ue.URLError:
+        print(footer(ok=False, label="Studio not reachable at 127.0.0.1:8799 — start it with: railcall studio"))
+        return 1
+    except Exception as e:
+        print(footer(ok=False, label=f"send failed: {e}"))
+        return 1
+
+    if resp.get("ok"):
+        receipt = resp.get("receipt", {})
+        ts = receipt.get("timestamp", "")
+        status = receipt.get("status", "delivered")
+        ch = receipt.get("channel", "?")
+        lines = [
+            c(f"→ {target}", "cyan") + "  " + c(f"#{ch}", "amber") + "  " + c(status, "green"),
+            c(f"  {ts}", "slate"),
+            c(f"  audit: .railcall_workspace/integration_audit.jsonl", "dim"),
+        ]
+        print(panel(lines, title=f"RAILCALL · {target} send · receipt", color="cyan"))
+        print(footer(ok=True))
+        return 0
+    print(footer(ok=False, label=f"{target} send refused: {resp.get('error', 'unknown')}"))
+    return 1
+
+
+def cmd_telegram(args):
+    """railcall telegram <bot|chats>
+
+      railcall telegram bot <TOKEN>          # save the bot token (create at @BotFather)
+      railcall telegram chats                # probe getUpdates to help you discover chat_ids
+    """
+    if not args:
+        print(footer(ok=False, label="usage: railcall telegram <bot|chats>"))
+        return 1
+    keys_path = os.path.expanduser("~/.railcall/station/.railcall_workspace/keys.local.json")
+    def _load():
+        try:
+            with open(keys_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    def _save(k):
+        os.makedirs(os.path.dirname(keys_path), exist_ok=True)
+        with open(keys_path, "w", encoding="utf-8") as f:
+            json.dump(k, f, indent=2)
+
+    if args[0] == "bot":
+        if len(args) < 2:
+            print(footer(ok=False, label="usage: railcall telegram bot <TOKEN>"))
+            return 1
+        token = args[1].strip()
+        keys = _load()
+        entry = keys.get("telegram") or {}
+        if not isinstance(entry, dict):
+            entry = {}
+        entry["bot_token"] = token
+        entry.setdefault("channels", {})
+        keys["telegram"] = entry
+        _save(keys)
+        print(footer(ok=True, label="telegram bot_token saved (never leaves this machine)"))
+        return 0
+
+    if args[0] == "chats":
+        # Poll getUpdates so users can find their chat_ids
+        keys = _load()
+        entry = keys.get("telegram") or {}
+        token = entry.get("bot_token") if isinstance(entry, dict) else None
+        if not token:
+            print(footer(ok=False, label="no bot_token — run: railcall telegram bot <TOKEN>"))
+            return 1
+        import urllib.request as _ur
+        try:
+            with _ur.urlopen(f"https://api.telegram.org/bot{token}/getUpdates", timeout=10) as r:
+                resp = json.loads(r.read().decode())
+        except Exception as e:
+            print(footer(ok=False, label=f"telegram API failed: {e}"))
+            return 1
+        seen = {}
+        for u in resp.get("result", []):
+            msg = u.get("message") or u.get("channel_post") or {}
+            chat = msg.get("chat") or {}
+            cid = chat.get("id")
+            if cid is not None and cid not in seen:
+                seen[cid] = chat.get("title") or chat.get("username") or chat.get("first_name") or "?"
+        if not seen:
+            lines = [c("no messages yet — send a message to your bot first", "amber"),
+                     c("then re-run: railcall telegram chats", "dim")]
+        else:
+            lines = [c("chat_id      name", "dim")]
+            for cid, name in seen.items():
+                lines.append(f"  {c(str(cid), 'green'):20s} {name}")
+            lines.append("")
+            lines.append(c("add with: railcall channels add telegram <name> <chat_id>", "dim"))
+        print(panel(lines, title="RAILCALL · telegram · chats", color="cyan"))
+        print(footer(ok=True))
+        return 0
+
+    print(footer(ok=False, label=f"unknown telegram action '{args[0]}' — use bot or chats"))
+    return 1
+
+
+def cmd_notion(args):
+    """railcall notion <key|pages>
+
+      railcall notion key <secret_...>   # save the Notion integration secret
+      railcall notion pages              # list pages the integration can access
+    """
+    if not args:
+        print(footer(ok=False, label="usage: railcall notion <key|pages> [value]"))
+        return 1
+    keys_path = os.path.expanduser("~/.railcall/station/.railcall_workspace/keys.local.json")
+    def _load():
+        try:
+            with open(keys_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    def _save(k):
+        os.makedirs(os.path.dirname(keys_path), exist_ok=True)
+        with open(keys_path, "w", encoding="utf-8") as f:
+            json.dump(k, f, indent=2)
+
+    if args[0] == "key":
+        if len(args) < 2:
+            print(footer(ok=False, label="usage: railcall notion key <secret_...>"))
+            return 1
+        keys = _load()
+        entry = keys.get("notion") or {}
+        if not isinstance(entry, dict):
+            entry = {}
+        entry["api_key"] = args[1].strip()
+        entry.setdefault("channels", {})
+        keys["notion"] = entry
+        _save(keys)
+        print(footer(ok=True, label="notion api_key saved (never leaves this machine)"))
+        return 0
+
+    if args[0] == "pages":
+        import urllib.request as _ur
+        keys = _load()
+        entry = keys.get("notion") or {}
+        api_key = entry.get("api_key") if isinstance(entry, dict) else None
+        if not api_key:
+            print(footer(ok=False, label="no api_key — run: railcall notion key <secret_...>"))
+            return 1
+        try:
+            body = json.dumps({"filter": {"value": "page", "property": "object"}}).encode()
+            req = _ur.Request(
+                "https://api.notion.com/v1/search",
+                data=body, method="POST",
+                headers={"Content-Type": "application/json",
+                         "Authorization": f"Bearer {api_key}",
+                         "Notion-Version": "2022-06-28",
+                         "User-Agent": "RailCall-CLI/0.2"})
+            with _ur.urlopen(req, timeout=10) as r:
+                resp = json.loads(r.read().decode())
+        except Exception as e:
+            print(footer(ok=False, label=f"notion API failed: {e}"))
+            return 1
+        results = resp.get("results") or []
+        if not results:
+            lines = [c("No pages found — share pages with your Notion integration first:", "amber"),
+                     c("  Open page → ··· (top right) → Connections → add your integration", "dim")]
+        else:
+            lines = [c("title                                    page_id", "dim")]
+            for p in results[:20]:
+                title = ""
+                try:
+                    title = p["properties"]["title"]["title"][0]["plain_text"]
+                except Exception:
+                    try:
+                        title = next(iter(p.get("properties", {}).values()))["title"][0]["plain_text"]
+                    except Exception:
+                        title = "(untitled)"
+                pid = p.get("id", "?")
+                lines.append(f"  {title[:40]:42s} {c(pid, 'green')}")
+            lines.append("")
+            lines.append(c("add with: railcall channels add notion <name> <page_id>", "dim"))
+        print(panel(lines, title="RAILCALL · notion · pages", color="cyan"))
+        print(footer(ok=True))
+        return 0
+
+    print(footer(ok=False, label=f"unknown notion action '{args[0]}' — use key or pages"))
+    return 1
+
+
+def cmd_resend(args):
+    """railcall resend <key|to>
+
+      railcall resend key <re_...>            # save the Resend API key
+      railcall resend to <recipient@ex.com>   # set default recipient for future sends
+    """
+    if not args:
+        print(footer(ok=False, label="usage: railcall resend <key|to> <value>"))
+        return 1
+    keys_path = os.path.expanduser("~/.railcall/station/.railcall_workspace/keys.local.json")
+    def _load():
+        try:
+            with open(keys_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    def _save(k):
+        os.makedirs(os.path.dirname(keys_path), exist_ok=True)
+        with open(keys_path, "w", encoding="utf-8") as f:
+            json.dump(k, f, indent=2)
+
+    if args[0] == "key":
+        if len(args) < 2:
+            print(footer(ok=False, label="usage: railcall resend key <re_...>"))
+            return 1
+        keys = _load()
+        entry = keys.get("resend") or {}
+        if not isinstance(entry, dict):
+            entry = {}
+        entry["api_key"] = args[1].strip()
+        entry.setdefault("channels", {})
+        keys["resend"] = entry
+        _save(keys)
+        print(footer(ok=True, label="resend api_key saved (never leaves this machine)"))
+        return 0
+
+    if args[0] == "to":
+        if len(args) < 2:
+            print(footer(ok=False, label="usage: railcall resend to <recipient@example.com>"))
+            return 1
+        keys = _load()
+        entry = keys.get("resend") or {}
+        if not isinstance(entry, dict):
+            entry = {}
+        entry["default_to"] = args[1].strip()
+        keys["resend"] = entry
+        _save(keys)
+        print(footer(ok=True, label=f"resend default_to set to {args[1]}"))
+        return 0
+
+    print(footer(ok=False, label=f"unknown resend action '{args[0]}' — use key or to"))
+    return 1
+
+
+def cmd_github(args):
+    """railcall github <token|repos>
+
+      railcall github token <ghp_...>   # save a GitHub personal access token (needs `repo` scope)
+      railcall github repos             # list repos the token can access
+    """
+    if not args:
+        print(footer(ok=False, label="usage: railcall github <token|repos> [value]"))
+        return 1
+    keys_path = os.path.expanduser("~/.railcall/station/.railcall_workspace/keys.local.json")
+    def _load():
+        try:
+            with open(keys_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    def _save(k):
+        os.makedirs(os.path.dirname(keys_path), exist_ok=True)
+        with open(keys_path, "w", encoding="utf-8") as f:
+            json.dump(k, f, indent=2)
+
+    if args[0] == "token":
+        if len(args) < 2:
+            print(footer(ok=False, label="usage: railcall github token <ghp_...>"))
+            return 1
+        keys = _load()
+        entry = keys.get("github") or {}
+        if not isinstance(entry, dict):
+            entry = {}
+        entry["token"] = args[1].strip()
+        entry.setdefault("channels", {})
+        keys["github"] = entry
+        _save(keys)
+        print(footer(ok=True, label="github token saved (never leaves this machine)"))
+        return 0
+
+    if args[0] == "repos":
+        import urllib.request as _ur
+        keys = _load()
+        entry = keys.get("github") or {}
+        token = entry.get("token") if isinstance(entry, dict) else None
+        if not token:
+            print(footer(ok=False, label="no token — run: railcall github token <ghp_...>"))
+            return 1
+        try:
+            req = _ur.Request(
+                "https://api.github.com/user/repos?per_page=20&sort=updated",
+                method="GET",
+                headers={"Authorization": f"Bearer {token}",
+                         "Accept": "application/vnd.github+json",
+                         "X-GitHub-Api-Version": "2022-11-28",
+                         "User-Agent": "RailCall-CLI/0.2"})
+            with _ur.urlopen(req, timeout=10) as r:
+                resp = json.loads(r.read().decode())
+        except Exception as e:
+            print(footer(ok=False, label=f"github API failed: {e}"))
+            return 1
+        if not isinstance(resp, list) or not resp:
+            lines = [c("No repos found — check that the token has `repo` scope.", "amber")]
+        else:
+            lines = [c("owner/repo                                private", "dim")]
+            for r_ in resp[:20]:
+                full = r_.get("full_name", "?")
+                priv = c("private", "amber") if r_.get("private") else c("public", "green")
+                lines.append(f"  {full[:44]:46s} {priv}")
+            lines.append("")
+            lines.append(c("add with: railcall channels add github <alias> <owner/repo>", "dim"))
+        print(panel(lines, title="RAILCALL · github · repos", color="cyan"))
+        print(footer(ok=True))
+        return 0
+
+    print(footer(ok=False, label=f"unknown github action '{args[0]}' — use token or repos"))
+    return 1
+
+
+def cmd_channels(args):
+    """railcall channels <list|add|remove|default> …
+
+    Manage per-integration named webhooks for slack and discord.
+
+      railcall channels list                          # show all
+      railcall channels list slack                    # show slack channels
+      railcall channels add slack deploys <url>       # add a channel
+      railcall channels remove slack deploys          # remove a channel
+      railcall channels default slack deploys         # set default channel
+    """
+    if not args:
+        print(footer(ok=False, label="usage: railcall channels <list|add|remove|default> …"))
+        return 1
+    action = args[0].lower()
+    import urllib.request as _ur, urllib.error as _ue
+
+    keys_path = os.path.expanduser("~/.railcall/station/.railcall_workspace/keys.local.json")
+    def _load():
+        try:
+            with open(keys_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    def _save(k):
+        os.makedirs(os.path.dirname(keys_path), exist_ok=True)
+        with open(keys_path, "w", encoding="utf-8") as f:
+            json.dump(k, f, indent=2)
+
+    if action == "list":
+        try:
+            url = "http://127.0.0.1:8799/api/channels"
+            if len(args) >= 2 and args[1] in ("slack", "discord", "msteams", "teams", "webhook", "gsheets", "gdocs", "telegram", "resend", "notion", "github"):
+                url += f"?integration={'msteams' if args[1] == 'teams' else args[1]}"
+            with _ur.urlopen(url, timeout=5) as r:
+                data = json.loads(r.read().decode("utf-8"))
+        except Exception:
+            print(footer(ok=False, label="Studio not reachable at 127.0.0.1:8799 — start with: railcall studio"))
+            return 1
+        lines = []
+        for iid, info in data.items():
+            if not info.get("configured"):
+                lines.append(c(f"{iid}", "dim") + "  " + c("(not configured)", "slate"))
+                continue
+            chs = info.get("channels", [])
+            dflt = info.get("default")
+            lines.append(c(f"{iid}", "cyan"))
+            for ch in chs:
+                marker = c("★", "amber") if ch == dflt else " "
+                lines.append(f"  {marker} " + c(ch, "green"))
+        print(panel(lines or [c("no messaging integrations configured", "slate")],
+                    title="RAILCALL · channels", color="cyan"))
+        print(footer(ok=True))
+        return 0
+
+    if action == "add":
+        if len(args) < 4 or args[1] not in ("slack", "discord", "teams", "msteams", "webhook", "gsheets", "gdocs", "telegram", "resend", "notion", "github"):
+            print(footer(ok=False, label="usage: railcall channels add <slack|discord|teams|webhook|gsheets|gdocs|telegram|resend|notion|github> <name> <url-or-id>"))
+            return 1
+        iid = "msteams" if args[1] == "teams" else args[1]
+        name, hook = args[2], args[3]
+        keys = _load()
+        entry = keys.get(iid) or {}
+
+        # Telegram shape: channels map name → chat_id (not URL). Requires bot_token to be set first.
+        if iid == "telegram":
+            if not isinstance(entry, dict):
+                entry = {}
+            if not entry.get("bot_token"):
+                print(footer(ok=False, label="set bot_token first: railcall telegram bot <TOKEN>"))
+                return 1
+            entry.setdefault("channels", {})
+            entry["channels"][name] = hook  # hook = chat_id
+            entry.setdefault("default_channel", name)
+            keys[iid] = entry
+            _save(keys)
+            print(footer(ok=True, label=f"added telegram channel: {name} → chat {hook}"))
+            return 0
+
+        # Notion shape: channels map name → page_id. Requires api_key to be set first.
+        if iid == "notion":
+            if not isinstance(entry, dict):
+                entry = {}
+            if not entry.get("api_key"):
+                print(footer(ok=False, label="set api_key first: railcall notion key <secret_...>"))
+                return 1
+            # Accept either a raw page_id or a Notion URL — extract the id either way
+            raw_id = hook.strip()
+            if "notion.so" in raw_id:
+                raw_id = raw_id.rstrip("/").split("-")[-1].split("?")[0]
+                # Notion page IDs in URLs may lack hyphens — insert them
+                raw_id = raw_id.replace(" ", "")
+            entry.setdefault("channels", {})
+            entry["channels"][name] = raw_id
+            entry.setdefault("default_channel", name)
+            keys[iid] = entry
+            _save(keys)
+            print(footer(ok=True, label=f"added notion page: {name} → {raw_id}"))
+            return 0
+
+        # GitHub shape: channels map alias → owner/repo. Requires token to be set first.
+        if iid == "github":
+            if not isinstance(entry, dict):
+                entry = {}
+            if not entry.get("token"):
+                print(footer(ok=False, label="set token first: railcall github token <ghp_...>"))
+                return 1
+            repo_slug = hook.strip()
+            # Accept a github URL and reduce to owner/repo
+            if "github.com" in repo_slug:
+                parts = repo_slug.split("github.com/", 1)[-1].strip("/").split("/")
+                if len(parts) >= 2:
+                    repo_slug = f"{parts[0]}/{parts[1]}"
+            if "/" not in repo_slug:
+                print(footer(ok=False, label=f"expected owner/repo (got '{repo_slug}')"))
+                return 1
+            entry.setdefault("channels", {})
+            entry["channels"][name] = repo_slug
+            entry.setdefault("default_channel", name)
+            keys[iid] = entry
+            _save(keys)
+            print(footer(ok=True, label=f"added github repo: {name} → {repo_slug}"))
+            return 0
+
+        # Resend shape: channels map name → from-address. Requires api_key to be set first.
+        if iid == "resend":
+            if not isinstance(entry, dict):
+                entry = {}
+            if not entry.get("api_key"):
+                print(footer(ok=False, label="set api_key first: railcall resend key <re_...>"))
+                return 1
+            entry.setdefault("channels", {})
+            entry["channels"][name] = hook  # hook = from-address
+            entry.setdefault("default_channel", name)
+            keys[iid] = entry
+            _save(keys)
+            print(footer(ok=True, label=f"added resend channel: {name} → {hook}"))
+            return 0
+
+        # Migrate legacy single-URL shape into channels.default
+        if isinstance(entry, str):
+            entry = {"channels": {"default": entry.strip()}, "default_channel": "default"}
+        elif isinstance(entry, dict):
+            legacy = entry.get("SLACK_WEBHOOK_URL") or entry.get("DISCORD_WEBHOOK_URL") or entry.get("webhook_url")
+            channels = dict(entry.get("channels") or {})
+            if legacy and "default" not in channels:
+                channels["default"] = legacy.strip() if isinstance(legacy, str) else legacy
+                entry.pop("SLACK_WEBHOOK_URL", None)
+                entry.pop("DISCORD_WEBHOOK_URL", None)
+                entry.pop("webhook_url", None)
+            entry["channels"] = channels
+            entry.setdefault("default_channel", "default" if "default" in channels else None)
+        entry.setdefault("channels", {})
+        entry["channels"][name] = hook
+        keys[iid] = entry
+        _save(keys)
+        print(footer(ok=True, label=f"added {iid} channel: {name}"))
+        return 0
+
+    if action == "remove":
+        if len(args) < 3 or args[1] not in ("slack", "discord", "teams", "msteams", "webhook", "gsheets", "gdocs", "telegram", "resend", "notion", "github"):
+            print(footer(ok=False, label="usage: railcall channels remove <slack|discord|teams|webhook|gsheets|gdocs|telegram|resend|notion|github> <name>"))
+            return 1
+        iid = "msteams" if args[1] == "teams" else args[1]
+        name = args[2]
+        keys = _load()
+        entry = keys.get(iid) or {}
+        if isinstance(entry, dict) and isinstance(entry.get("channels"), dict) and name in entry["channels"]:
+            del entry["channels"][name]
+            if entry.get("default_channel") == name:
+                entry["default_channel"] = None
+            keys[iid] = entry
+            _save(keys)
+            print(footer(ok=True, label=f"removed {iid} channel: {name}"))
+            return 0
+        print(footer(ok=False, label=f"no such channel '{name}' on {iid}"))
+        return 1
+
+    if action == "default":
+        if len(args) < 3 or args[1] not in ("slack", "discord", "teams", "msteams", "webhook", "gsheets", "gdocs", "telegram", "resend", "notion", "github"):
+            print(footer(ok=False, label="usage: railcall channels default <slack|discord|teams|webhook|gsheets|gdocs|telegram|resend|notion|github> <name>"))
+            return 1
+        iid = "msteams" if args[1] == "teams" else args[1]
+        name = args[2]
+        keys = _load()
+        entry = keys.get(iid) or {}
+        if not (isinstance(entry, dict) and name in (entry.get("channels") or {})):
+            print(footer(ok=False, label=f"no such channel '{name}' on {iid}"))
+            return 1
+        entry["default_channel"] = name
+        keys[iid] = entry
+        _save(keys)
+        print(footer(ok=True, label=f"{iid} default → {name}"))
+        return 0
+
+    print(footer(ok=False, label=f"unknown channels action '{action}' — use list, add, remove, default"))
+    return 1
 
 
 def cmd_health(_=None):
@@ -1955,7 +2548,9 @@ COMMANDS = {"build": cmd_build, "interpret": cmd_interpret, "daemon": cmd_daemon
             "doctor": cmd_doctor, "demo": cmd_demo, "rotate-key": cmd_rotate_key,
             "balance": cmd_balance, "login": cmd_login, "studio": cmd_studio, "audit": cmd_audit,
             "verify": cmd_verify, "receipts": cmd_receipts, "backup": cmd_backup, "restore": cmd_restore,
-            "backup-verify": cmd_backup_verify}
+            "backup-verify": cmd_backup_verify, "send": cmd_send, "channels": cmd_channels,
+            "telegram": cmd_telegram, "resend": cmd_resend, "notion": cmd_notion,
+            "github": cmd_github}
 
 
 def main():
