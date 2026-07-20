@@ -1,7 +1,6 @@
 #!/bin/bash
-# Railcall network installer.  Usage (ships the full local Studio):
-#   curl -fsSL https://railcall.ai/install.sh | bash
-#   or direct: curl -fsSL https://raw.githubusercontent.com/patl4588/railcall-core/main/install.sh | bash
+# Railcall network installer.  Usage:
+#   curl -fsSL https://raw.githubusercontent.com/patl4588/railcall-core/main/install.sh | bash
 set -euo pipefail
 
 CYAN='\033[0;36m'; GREEN='\033[0;32m'; BLUE='\033[0;34m'; RED='\033[0;31m'; NC='\033[0m'
@@ -18,16 +17,22 @@ RC_HOME="$HOME/.railcall"
 RC_BIN="$RC_HOME/bin"
 RC_CONF="$HOME/.config/railcall"
 FILES="railcall_cli.py railcall_companion_daemon.py vault_io.py receipt_signer.py"
+GOVERNANCE_FILES="governance/__init__.py governance/policy_engine.py governance/policy_schema.py governance/receipt_v2.py governance/defaults/__init__.py governance/defaults/governance.default.yml"
+STATION_SHA="9d0102ab6951af9ad72bc89c96f7c0eeb631dc86fba729288f074e73abce8a2b"
 
 # Full disclosure BEFORE the first write — everything this installer touches, up front:
 echo -e "${BLUE}This installer writes to:${NC}"
-echo -e "${BLUE}  · $RC_HOME — the CLI, the 'railcall' launcher, and the Studio bundle (~22MB download)${NC}"
+echo -e "${BLUE}  · $RC_HOME — the CLI, the 'railcall' launcher, and the Studio bundle (~5MB download)${NC}"
 echo -e "${BLUE}  · $RC_CONF — your pre-login local trial token (token.json, owner-only chmod 600)${NC}"
 echo -e "${BLUE}  · $HOME/Desktop — a double-click 'RailCall Studio.command' launcher (only if a Desktop folder exists)${NC}"
 echo -e "${BLUE}  · your shell rc (.zshrc / .bashrc / .bash_profile) — one PATH line, only if one of those files exists${NC}"
 echo -e "${BLUE}  · Python user packages — the 'cryptography' package via pip --user, announced below, only if missing${NC}"
 
 mkdir -p "$RC_HOME" "$RC_BIN" "$RC_CONF"
+mkdir -p "$HOME/.railcall/transaction_runs"
+mkdir -p "$HOME/.railcall/library/promotions"
+mkdir -p "$HOME/.railcall/library/promotions"
+cp -f library/promotions/governed_legos_registry.json "$HOME/.railcall/library/promotions/" 2>/dev/null || echo '{"governed_legos": [], "version": "1.0", "note": "Add promoted workflow legos here"}' > "$HOME/.railcall/library/promotions/governed_legos_registry.json"
 
 # Pick a downloader (-f makes curl FAIL on a 404 instead of saving the error page).
 if command -v curl >/dev/null 2>&1; then
@@ -70,10 +75,16 @@ LOCAL_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)" || LOCAL_DIR=""
 # then paste the printed lines over the case arms in pin_for() below.
 pin_for() {
     case "$1" in
-        railcall_cli.py)              echo 632540b886aa49c974bb0844f74fc9cd1cbde2fba6a3298a29510e554f05c22b ;;
-        railcall_companion_daemon.py) echo b42a2023b0a6316e1f449c14a2fa6e4e1f3202c01afa54005b3d5631ee8a43b4 ;;
-        vault_io.py)                  echo 17b0e644a93c773d3f7b5e5e8b046ea39472364b532b545846f3c617433792f8 ;;
-        receipt_signer.py)            echo 36b84579880db9bf78c9bc21cd40c6976094ae8ea978c939f2feef4f97041b9e ;;
+        railcall_cli.py)                          echo d80cbe1906b2bf648b86013bf840ad6c64b80197f64e23c94803fcd9c10b98e3 ;;
+        railcall_companion_daemon.py)             echo 6a40af4c5bfdf34b706496eea2889488d563acb35d5c9b7484dd2ae8a7c80805 ;;
+        vault_io.py)                              echo 17b0e644a93c773d3f7b5e5e8b046ea39472364b532b545846f3c617433792f8 ;;
+        receipt_signer.py)                        echo 36b84579880db9bf78c9bc21cd40c6976094ae8ea978c939f2feef4f97041b9e ;;
+        governance/__init__.py)                   echo a039118f68adec79c887c26f3a7218b0096da47bb18c7efb13e52f06af94cedd ;;
+        governance/policy_engine.py)              echo 6518840af666c2bcffe53b8bc73c19d7ad3c933fdede5bdc6c7dfe9dfdc831fb ;;
+        governance/policy_schema.py)              echo 943b777cef4c8a776490a0e5950885180f8d2e815bdeee4c7866c4022ee9410a ;;
+        governance/receipt_v2.py)                 echo fad0581fe6e6780608c78fec9a124eb1a833159067107f4ff313c6ba459971c6 ;;
+        governance/defaults/__init__.py)          echo 5d16591a5456de8b492aa701a1f7b989040995513fc813600d0d445b24131e34 ;;
+        governance/defaults/governance.default.yml) echo ff56072e81ed4908ea91f567741238b387e536cd1f5974513ee18df0d5c575b9 ;;
         *) echo "" ;;
     esac
 }
@@ -141,6 +152,22 @@ for f in $FILES; do
 done
 chmod +x "$RC_HOME/railcall_cli.py"
 
+# Phase 1: governance package — install alongside the CLI files so the policy engine is available.
+echo -e "${BLUE}Installing governance policy engine (Phase 1) ...${NC}"
+mkdir -p "$RC_HOME/governance/defaults"
+for f in $GOVERNANCE_FILES; do
+    dest="$RC_HOME/$f"
+    if [ -n "$LOCAL_DIR" ] && [ -s "$LOCAL_DIR/$f" ] && pin_ok "$f" "$LOCAL_DIR/$f"; then
+        cp "$LOCAL_DIR/$f" "$dest"; echo -e "${GREEN}  ✓ $f${BLUE} (local checkout)${NC}"; continue
+    fi
+    if fetch "$RAW_BASE/$f" "$dest" 2>/dev/null && [ -s "$dest" ] && pin_ok "$f" "$dest"; then
+        echo -e "${GREEN}  ✓ $f${NC}"; continue
+    fi
+    rm -f "$dest"
+    echo -e "${RED}✗ Could not fetch a valid $f — governance policy engine will not be available.${NC}"
+    echo -e "${RED}  Receipts will still be written but policy gating is disabled on this install.${NC}"
+done
+
 # Ed25519 receipt signing needs `cryptography`. Best-effort + NON-FATAL: without it the daemon still
 # writes airlock-verified, SHA-256 receipts — just honestly UNSIGNED. With it, every receipt is signed.
 # We VERIFY the import after each attempt (pip's exit code alone is not proof it's importable), and on
@@ -171,11 +198,19 @@ else
     fi
 fi
 
-# ---- Studio (the visual builder v0.2) — fetch + unpack the station bundle (one-time, ~22MB) ----
-STATION_URL="https://github.com/patl4588/railcall-core/releases/download/station-v0.3/railcall_station.tar.gz"
+# ---- Studio (the visual builder) — fetch + unpack the station bundle (one-time, ~22MB) ----
+STATION_URL="https://github.com/patl4588/railcall-core/releases/download/station-v0.15/railcall_station.tar.gz"
 STATION_DIR="$RC_HOME/station"
 echo -e "${BLUE}Downloading the RailCall Studio (one-time, ~22MB) ...${NC}"
 if fetch "$STATION_URL" "$RC_HOME/station.tar.gz"; then
+    actual=$(shasum -a 256 "$RC_HOME/station.tar.gz" | awk '{print $1}')
+    if [ "$actual" != "$STATION_SHA" ]; then
+        echo "  ✗ SECURITY: station bundle failed integrity check — refusing"
+        echo "    expected $STATION_SHA"
+        echo "    got      $actual"
+        rm -f "$RC_HOME/station.tar.gz"
+        exit 1
+    fi
     mkdir -p "$STATION_DIR"
     if tar -xzf "$RC_HOME/station.tar.gz" -C "$STATION_DIR" 2>/dev/null && [ -f "$STATION_DIR/workbench/studio_server.py" ]; then
         rm -f "$RC_HOME/station.tar.gz"
