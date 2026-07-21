@@ -27,9 +27,16 @@ $RcBin   = Join-Path $RcHome 'bin'
 $RcConf  = Join-Path $env:USERPROFILE '.config\railcall'
 $Files   = @('railcall_cli.py','railcall_companion_daemon.py','vault_io.py','receipt_signer.py')
 
-# raw.githubusercontent.com is the primary source (pinned + integrity verified).
-# CDN fallbacks have been removed for supply-chain purity (no external mirrors).
+# raw.githubusercontent.com is blocked/throttled by some regional ISPs (a transparent proxy can even
+# hand back a fake "200 OK" whose body is a 404 page); jsDelivr mirrors the SAME repo. We try raw, then
+# the CDN — identical to install.sh.
 $RawBase = 'https://raw.githubusercontent.com/patl4588/railcall-core/main'
+$CdnBase = 'https://cdn.jsdelivr.net/gh/patl4588/railcall-core@main'
+# Our own origin. Every byte is still sha256-verified against the pins below, so a mirror
+# can never inject anything. Needed because raw.githubusercontent.com is blocked or
+# transparently proxied on some networks — those return a different body, which fails the
+# pin. That is the gate working, not a stale pin.
+$MirrorBase = 'https://railcall.ai/cli'
 
 # ---- Supply-chain integrity pins ------------------------------------------------------------------
 # Every core file is verified against a sha256 PINNED here. This stops a compromised 'main' (or a MITM
@@ -42,8 +49,8 @@ $RawBase = 'https://raw.githubusercontent.com/patl4588/railcall-core/main'
 #     ForEach-Object { "    '{0}' = '{1}'" -f $_.Name, (Get-FileHash $_ -Algorithm SHA256).Hash.ToLower() }
 # then paste the printed lines into $Pins below.
 $Pins = @{
-    'railcall_cli.py'              = '632540b886aa49c974bb0844f74fc9cd1cbde2fba6a3298a29510e554f05c22b'
-    'railcall_companion_daemon.py' = 'b42a2023b0a6316e1f449c14a2fa6e4e1f3202c01afa54005b3d5631ee8a43b4'
+    'railcall_cli.py'              = '45f2e8a6ea4910ecf2a878098d60905f8b1071f2e9ac9f328a7f40320fb5a3bc'
+    'railcall_companion_daemon.py' = '6a40af4c5bfdf34b706496eea2889488d563acb35d5c9b7484dd2ae8a7c80805'
     'vault_io.py'                  = '17b0e644a93c773d3f7b5e5e8b046ea39472364b532b545846f3c617433792f8'
     'receipt_signer.py'            = '36b84579880db9bf78c9bc21cd40c6976094ae8ea978c939f2feef4f97041b9e'
 }
@@ -77,23 +84,15 @@ function Resolve-Python {
 # Does the resolved Python compile this file? (mirrors install.sh's py_compile gate)
 function Test-PyCompile([string]$path) {
     $pre = $script:PyPre
-    try {
-        & $script:PyExe @pre -m py_compile $path 2>$null | Out-Null
-        return ($LASTEXITCODE -eq 0)
-    } catch {
-        return $false
-    }
+    & $script:PyExe @pre -m py_compile $path 2>$null | Out-Null
+    return ($LASTEXITCODE -eq 0)
 }
 
 # Is 'cryptography' importable by the resolved Python?
 function Test-Crypto {
     $pre = $script:PyPre
-    try {
-        & $script:PyExe @pre -c "import cryptography" 2>$null | Out-Null
-        return ($LASTEXITCODE -eq 0)
-    } catch {
-        return $false
-    }
+    & $script:PyExe @pre -c "import cryptography" 2>$null | Out-Null
+    return ($LASTEXITCODE -eq 0)
 }
 
 # Verify a file on disk against its pin. $false (with a LOUD security refusal) on any mismatch or an
@@ -104,32 +103,26 @@ function Test-Pin([string]$f, [string]$path) {
         Write-C "  [x] SECURITY: $f has no integrity pin in this installer - refusing to install unpinned code." Red
         return $false
     }
-    # Normalize CRLF to LF to ensure line-ending-insensitive verification (robust on Windows git checkouts)
-    try {
-        $text = [IO.File]::ReadAllText($path)
-        $lfText = $text -replace "`r`n", "`n"
-        $bytes = [Text.Encoding]::UTF8.GetBytes($lfText)
-        $sha = [Security.Cryptography.SHA256]::Create()
-        $hashBytes = $sha.ComputeHash($bytes)
-        $got = (($hashBytes | ForEach-Object { "{0:x2}" -f $_ }) -join "").ToLower()
-    } catch {
-        Write-C "  [x] SECURITY: Could not read/hash $path." Red
-        return $false
-    }
+    $got = (Get-FileHash -Path $path -Algorithm SHA256).Hash.ToLower()
     if ($got -ne $want) {
-        Write-C "  [x] SECURITY: $f failed its integrity pin - REFUSING this file. It parses, but the bytes are not what we published." Red
-        Write-C "      expected sha256 $want" Red
-        Write-C "      got      sha256 $got" Red
+        # QUIET per-source. This fires once per source we try, and trying the next source
+        # is the normal recovery path — printing a red SECURITY block here made a *successful*
+        # install look like a breach and led people to conclude the pins were stale. The loud
+        # message belongs in the caller, once, only when EVERY source has failed.
+        $script:LastPinFail = "$f expected $want got $got"
         return $false
     }
     return $true
 }
 
-# Get + validate one file: local checkout (if run from one), then raw GitHub. A source
+# Get + validate one file: local checkout (if run from one), then raw GitHub, then jsDelivr. A source
 # counts only if it is non-empty AND compiles as Python AND matches its pinned sha256 — so a proxy's
 # fake 404 body (fails compile) and any tampered-but-compiling body (fails the pin) are both rejected.
 function Get-CoreFile([string]$f) {
     $dest = Join-Path $RcHome $f
+    # Reset per FILE, not per source — otherwise a file that fails to download at all would
+    # report the previous file's hash mismatch.
+    $script:LastPinFail = $null
     if ($ScriptDir) {
         $src = Join-Path $ScriptDir $f
         if ((Test-Path $src) -and ((Get-Item $src).Length -gt 0) -and (Test-PyCompile $src) -and (Test-Pin $f $src)) {
@@ -138,17 +131,31 @@ function Get-CoreFile([string]$f) {
             return $true
         }
     }
-    try {
-        Invoke-WebRequest -Uri "$RawBase/$f" -OutFile $dest -UseBasicParsing -ErrorAction Stop
-    } catch {
+    foreach ($base in @($RawBase, $MirrorBase, $CdnBase)) {
+        try {
+            Invoke-WebRequest -Uri "$base/$f" -OutFile $dest -UseBasicParsing -ErrorAction Stop
+        } catch {
+            if (Test-Path $dest) { Remove-Item $dest -Force -ErrorAction SilentlyContinue }
+            continue
+        }
+        if ((Test-Path $dest) -and ((Get-Item $dest).Length -gt 0) -and (Test-PyCompile $dest) -and (Test-Pin $f $dest)) {
+            if ($base -like '*jsdelivr*') { Write-C "  [ok] $f (via CDN mirror)" Green }
+            elseif ($base -like '*railcall.ai*') { Write-C "  [ok] $f (via railcall.ai - your network altered the GitHub copy)" Green }
+            else { Write-C "  [ok] $f" Green }
+            return $true
+        }
         if (Test-Path $dest) { Remove-Item $dest -Force -ErrorAction SilentlyContinue }
-        return $false
     }
-    if ((Test-Path $dest) -and ((Get-Item $dest).Length -gt 0) -and (Test-PyCompile $dest) -and (Test-Pin $f $dest)) {
-        Write-C "  [ok] $f" Green
-        return $true
+    if ($script:LastPinFail) {
+        Write-C "  [x] $f - every source returned bytes that do not match our published hash." Red
+        Write-C "      $($script:LastPinFail)" Red
+        Write-C "      This almost always means your network is MODIFYING downloads (corporate" Red
+        Write-C "      proxy, ISP filter, or captive portal) - not that the pin is wrong. The" Red
+        Write-C "      check is doing its job. Do NOT edit the pins to make this pass." Red
+        Write-C "      Try another network, or install from a clone:" Red
+        Write-C "        git clone https://github.com/patl4588/railcall-core" Blue
+        Write-C "        cd railcall-core; .\install.ps1" Blue
     }
-    if (Test-Path $dest) { Remove-Item $dest -Force -ErrorAction SilentlyContinue }
     return $false
 }
 
@@ -158,7 +165,7 @@ $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { $null }
 
 # ---- Full disclosure BEFORE the first write -------------------------------------------------------
 Write-C "This installer writes to:" Blue
-Write-C "  - $RcHome - the 4 core CLI files, the 'railcall' launcher shim, and the Studio bundle (~22MB)" Blue
+Write-C "  - $RcHome - the 4 core CLI files, the 'railcall' launcher shim, and the Studio bundle (~5MB)" Blue
 Write-C "  - $RcConf - your pre-login local trial token (token.json)" Blue
 Write-C "  - your USER PATH (HKCU environment) - one entry for $RcBin, only if not already present" Blue
 Write-C "  - Python user packages - the 'cryptography' package via pip --user, only if missing" Blue
@@ -173,10 +180,10 @@ if (-not (Resolve-Python)) {
 Write-C "  Using Python: $script:PyExe $(($script:PyPre) -join ' ')" Blue
 
 # ---- Download + verify the CLI --------------------------------------------------------------------
-Write-C "Downloading CLI (raw.githubusercontent.com only, pinned + verified, no CDN) ..." Blue
+Write-C "Downloading CLI (raw.githubusercontent.com, CDN fallback) ..." Blue
 foreach ($f in $Files) {
     if (-not (Get-CoreFile $f)) {
-        Write-C "[x] Could not install a valid $f from GitHub." Red
+        Write-C "[x] Could not install a valid $f from GitHub or the CDN mirror." Red
         Write-C "    If a SECURITY integrity-pin refusal printed above, STOP - do not work around it; the published" Red
         Write-C "    bytes did not match this installer's pin. Otherwise it is usually a regional network block." Red
         Write-C "    Install from a checkout instead:" Blue
@@ -205,27 +212,61 @@ if (Test-Crypto) {
     }
 }
 
-# ---- Studio (the visual builder v0.2) - fetch + unpack the station bundle (one-time, ~22MB) ------------
-# Best-effort + non-fatal, mirroring install.sh. 'tar' ships with Windows 10 1803+; without it the CLI
-# still works and this can be retried by re-running the installer.
-$StationUrl = 'https://github.com/patl4588/railcall-core/releases/download/station-v0.2/railcall_station.tar.gz'
-$StationDir = Join-Path $RcHome 'station'
-$StationTgz = Join-Path $RcHome 'station.tar.gz'
-Write-C "Downloading the RailCall Studio (one-time, ~22MB) ..." Blue
+# ---- Studio (the visual builder) - fetch + SHA-verify + unpack the station bundle (~5MB) ----------
+# SHA gate matches install.sh's STATION_SHA — Windows users get the same fail-closed integrity
+# check macOS/Linux users have had since v0.4. Uses tar (Windows 10 1803+ ships tar.exe natively);
+# the older ZIP-first path was removed because we've never actually shipped a .zip release asset.
+$StationTgzUrl = 'https://github.com/patl4588/railcall-core/releases/download/station-v0.16/railcall_station.tar.gz'
+$StationSha    = 'd33df65f0e8a53e87e0d4eb304d19d18f150ec3148e3d1ed4424acb122217c31'
+$StationDir    = Join-Path $RcHome 'station'
+$StationTgz    = Join-Path $RcHome 'station.tar.gz'
+# Mirror on our own origin — the bundle had ONE source, so a network that blocks or
+# rewrites github.com failed the install even after the CLI files recovered. $StationSha
+# is enforced on whichever source answers, so a mirror cannot substitute a different bundle.
+$StationMirrorUrl = 'https://railcall.ai/railcall_station.tar.gz'
+Write-C "Downloading the RailCall Studio (one-time, ~5MB) ..." Blue
 $studioOk = $false
+$stationGot = $null
+
 try {
-    Invoke-WebRequest -Uri $StationUrl -OutFile $StationTgz -UseBasicParsing -ErrorAction Stop
+    foreach ($su in @($StationTgzUrl, $StationMirrorUrl)) {
+        try { Invoke-WebRequest -Uri $su -OutFile $StationTgz -UseBasicParsing -ErrorAction Stop } catch { continue }
+        $h = (Get-FileHash -Path $StationTgz -Algorithm SHA256).Hash.ToLower()
+        if ($h -eq $StationSha) {
+            if ($su -eq $StationMirrorUrl) { Write-C "  . fetched via railcall.ai (GitHub unreachable or altered)" Blue }
+            break
+        }
+        $stationGot = $h
+        Remove-Item $StationTgz -Force -ErrorAction SilentlyContinue
+    }
+    if (-not (Test-Path $StationTgz)) { throw "no source returned a valid station bundle" }
+    # SHA gate — fail-closed. Silent bytes-mismatch would be a supply-chain smuggling window.
+    $actual = (Get-FileHash -Path $StationTgz -Algorithm SHA256).Hash.ToLower()
+    if ($actual -ne $StationSha) {
+        # Fatal — matches install.sh behavior. Mismatched bytes indicate tampering,
+        # MITM, or a wrong URL; safer to abort than to proceed with maybe-clean-CLI-
+        # and-tampered-Studio. Non-fatal handling would defeat the point of the gate.
+        Write-C "  [x] SECURITY: station bundle failed integrity check - refusing" Red
+        Write-C "      expected $StationSha" Red
+        Write-C "      got      $actual" Red
+        Remove-Item $StationTgz -Force -ErrorAction SilentlyContinue
+        exit 1
+    }
     New-Item -ItemType Directory -Force -Path $StationDir | Out-Null
     if (Get-Command tar -ErrorAction SilentlyContinue) {
         tar -xzf $StationTgz -C $StationDir 2>$null
         if (Test-Path (Join-Path $StationDir 'workbench\studio_server.py')) { $studioOk = $true }
+    } else {
+        Write-C "  [x] tar not found (Windows 10 1803+ ships it) - Studio skipped, CLI still works." Red
     }
-} catch {}
+} catch {
+    # Reached only for network failures — SHA mismatch takes the exit 1 path above.
+    Write-C "  [x] Could not download the Studio bundle - CLI still works; re-run to retry." Red
+}
 if (Test-Path $StationTgz) { Remove-Item $StationTgz -Force -ErrorAction SilentlyContinue }
+
 if ($studioOk) {
     Write-C "  [ok] Studio installed - run 'railcall studio' to open it in your browser." Green
-} else {
-    Write-C "  [x] Studio not installed here (needs the 'tar' command, Windows 10 1803+). CLI still works; re-run to retry." Red
 }
 
 # ---- Pre-login LOCAL trial token ------------------------------------------------------------------
@@ -264,34 +305,6 @@ if ($parts -notcontains $RcBin) {
 }
 # Make 'railcall' resolvable in THIS session too, without reopening the terminal.
 if (@(($env:Path).Split(';')) -notcontains $RcBin) { $env:Path = "$($env:Path);$RcBin" }
-
-# Also append to Git Bash / MinGW environment files if they exist or if Git Bash is installed,
-# ensuring shell environment PATH persistence.
-$UserProfile = $env:USERPROFILE
-$Bashrc = Join-Path $UserProfile '.bashrc'
-$BashProfile = Join-Path $UserProfile '.bash_profile'
-
-if ((Test-Path $Bashrc) -or (Test-Path $BashProfile) -or (Get-Command git -ErrorAction SilentlyContinue)) {
-    if (-not (Test-Path $Bashrc)) {
-        New-Item -ItemType File -Path $Bashrc -Force | Out-Null
-    }
-    $bashrcContent = [IO.File]::ReadAllText($Bashrc)
-    $rcBinPosix = $RcBin.Replace('\', '/').Replace('C:', '/c').Replace('c:', '/c')
-    if ($bashrcContent -notlike "*$RcBin*" -and $bashrcContent -notlike "*$rcBinPosix*") {
-        $RcBinEscaped = $rcBinPosix.Replace(' ', '\ ')
-        $BashLine = "`n# Added by Railcall installer`nexport PATH=`"`$PATH:$RcBinEscaped`"`n"
-        Add-Content -Path $Bashrc -Value $BashLine
-        Write-C "Added $RcBin to PATH in $Bashrc (for Git Bash / MinGW)." Green
-    }
-    if (-not (Test-Path $BashProfile)) {
-        "# Git Bash default`n" | Set-Content -Path $BashProfile -Encoding ascii
-    }
-    $profileContent = [IO.File]::ReadAllText($BashProfile)
-    if ($profileContent -notlike "*source ~/.bashrc*" -and $profileContent -notlike "*. ~/.bashrc*") {
-        $SourceLine = "`nif [ -f ~/.bashrc ]; then . ~/.bashrc; fi`n"
-        Add-Content -Path $BashProfile -Value $SourceLine
-    }
-}
 
 # ---- Done -----------------------------------------------------------------------------------------
 Write-C "Installed. LOCAL - BYOK - DRY-RUN - NO SENDS - everything runs on 127.0.0.1, nothing fires without your approval." Green
