@@ -21,9 +21,9 @@ MIRROR_BASE="https://railcall.ai/cli"
 RC_HOME="$HOME/.railcall"
 RC_BIN="$RC_HOME/bin"
 RC_CONF="$HOME/.config/railcall"
-FILES="railcall_cli.py railcall_companion_daemon.py vault_io.py receipt_signer.py"
+FILES="railcall_cli.py railcall_companion_daemon.py vault_io.py receipt_signer.py railcall_vault_drivers.py"
 GOVERNANCE_FILES="governance/__init__.py governance/policy_engine.py governance/policy_schema.py governance/receipt_v2.py governance/defaults/__init__.py governance/defaults/governance.default.yml"
-STATION_SHA="642005a21a1978eb4e17ece5a2eeab73837af4046eeea9cfdd44ae842198d15f"
+STATION_SHA="c519d6b1085fb8e20d9c100baf85754200363d7dc34d46a79105ad5c9d8afa2d"
 
 # Full disclosure BEFORE the first write — everything this installer touches, up front:
 echo -e "${BLUE}This installer writes to:${NC}"
@@ -80,10 +80,11 @@ LOCAL_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)" || LOCAL_DIR=""
 # then paste the printed lines over the case arms in pin_for() below.
 pin_for() {
     case "$1" in
-        railcall_cli.py)                          echo 27e98a518a595a9a78602c9c719ecdc20dd2bb8d75a270a5bd781535f4d27230 ;;
+        railcall_cli.py)                          echo df46e1ede210f7bf46711bd94110c0a99cac874fdf9c14908b35fc4d3f09fe20 ;;
         railcall_companion_daemon.py)             echo f6a43720157612adbc73723115166fbe3acf8e43f0113ea717cca27b9990a1b5 ;;
         vault_io.py)                              echo 17b0e644a93c773d3f7b5e5e8b046ea39472364b532b545846f3c617433792f8 ;;
         receipt_signer.py)                        echo 36b84579880db9bf78c9bc21cd40c6976094ae8ea978c939f2feef4f97041b9e ;;
+        railcall_vault_drivers.py)                echo 7ff6896532adcbcf8302039bafe403884f457d8fb2ed87320e8283c61f9df096 ;;
         governance/__init__.py)                   echo a039118f68adec79c887c26f3a7218b0096da47bb18c7efb13e52f06af94cedd ;;
         governance/policy_engine.py)              echo 6518840af666c2bcffe53b8bc73c19d7ad3c933fdede5bdc6c7dfe9dfdc831fb ;;
         governance/policy_schema.py)              echo 943b777cef4c8a776490a0e5950885180f8d2e815bdeee4c7866c4022ee9410a ;;
@@ -222,7 +223,7 @@ else
 fi
 
 # ---- Studio (the visual builder) — fetch + unpack the station bundle (one-time, ~22MB) ----
-STATION_URL="https://github.com/patl4588/railcall-core/releases/download/station-v0.18/railcall_station.tar.gz"
+STATION_URL="https://github.com/patl4588/railcall-core/releases/download/station-v0.27/railcall_station.tar.gz"
 # Mirror on our own origin. The tarball had ONE source, so a network that rewrites or
 # blocks github.com failed the install outright even after the CLI files recovered.
 # STATION_SHA is enforced identically on whichever source answers, so the mirror cannot
@@ -231,6 +232,20 @@ STATION_URL_MIRROR="https://railcall.ai/railcall_station.tar.gz"
 STATION_DIR="$RC_HOME/station"
 echo -e "${BLUE}Downloading the RailCall Studio (one-time, ~22MB) ...${NC}"
 station_get() {
+    # Air-gap path first: a local station.tar.gz next to install.sh wins over
+    # any network fetch. Same STATION_SHA gate — even the local copy is refused
+    # if bytes don't match the pin, so an air-gap bundle can't smuggle in a
+    # different station than the one this installer was minted for.
+    if [ -n "$LOCAL_DIR" ] && [ -s "$LOCAL_DIR/railcall_station.tar.gz" ]; then
+        a=$(sha256_of "$LOCAL_DIR/railcall_station.tar.gz")
+        if [ "$a" = "$STATION_SHA" ]; then
+            cp "$LOCAL_DIR/railcall_station.tar.gz" "$RC_HOME/station.tar.gz"
+            echo -e "${BLUE}  · loaded from local bundle (air-gap install)${NC}"
+            return 0
+        fi
+        STATION_GOT="$a"
+        echo -e "${RED}  ✗ local station bundle sha mismatch — falling back to network${NC}"
+    fi
     for u in "$STATION_URL" "$STATION_URL_MIRROR"; do
         fetch "$u" "$RC_HOME/station.tar.gz" || continue
         a=$(sha256_of "$RC_HOME/station.tar.gz")
@@ -327,6 +342,42 @@ if [ -n "$SHELL_CONFIG" ]; then
         echo "# Added by Railcall installer (supports Git Bash/MINGW on Windows)" >> "$SHELL_CONFIG"
         echo "export PATH=\"\$PATH:$RC_BIN\"" >> "$SHELL_CONFIG"
         echo -e "${GREEN}Added $RC_BIN to PATH in $SHELL_CONFIG${NC}"
+    fi
+fi
+
+# ── anonymous install ping ───────────────────────────────────────────────
+# One POST at the tail of a successful install: a stable per-machine hash
+# (sha256 of hostname + install-time salt cached in ~/.railcall/machine_id),
+# the version, OS, and arch. NO hostname, no username, no path, no IP —
+# we hash our end before sending. This is a counter, not tracking.
+# Skip entirely with RAILCALL_NO_TELEMETRY=1.
+if [ -z "${RAILCALL_NO_TELEMETRY:-}" ]; then
+    MACHINE_ID_FILE="$RC_HOME/machine_id"
+    if [ ! -f "$MACHINE_ID_FILE" ]; then
+        # Prefer python (already required by the CLI) for a random hex id.
+        # Falls back to /dev/urandom if python is somehow gone by this point.
+        if command -v "$PY" >/dev/null 2>&1; then
+            MID=$("$PY" -c "import secrets;print(secrets.token_hex(32))" 2>/dev/null || echo "")
+        fi
+        if [ -z "${MID:-}" ]; then
+            MID=$(head -c 32 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n' 2>/dev/null || echo "")
+        fi
+        if [ -n "$MID" ]; then
+            echo "$MID" > "$MACHINE_ID_FILE"
+            chmod 600 "$MACHINE_ID_FILE" 2>/dev/null || true
+        fi
+    fi
+    MID=$(cat "$MACHINE_ID_FILE" 2>/dev/null || true)
+    OS=$(uname -s 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    ARCH=$(uname -m 2>/dev/null || echo unknown)
+    if [ -n "${MID:-}" ]; then
+        # Fire-and-forget: 3s timeout, silent on failure. install.sh completes
+        # regardless — a marketplace outage does NOT block a user install.
+        curl -fsS --max-time 3 -o /dev/null \
+            -X POST -H "Content-Type: application/json" \
+            -d "{\"machine_id\":\"$MID\",\"version\":\"0.27.0\",\"station_sha\":\"$STATION_SHA\",\"os\":\"$OS\",\"arch\":\"$ARCH\"}" \
+            "https://railcall-marketplace-lggm.onrender.com/telemetry/station-install" \
+            2>/dev/null || true
     fi
 fi
 
