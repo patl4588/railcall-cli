@@ -1,0 +1,55 @@
+#!/bin/bash
+# Pre-commit hook — runs before every git commit in this repo.
+#
+# Enforcement: the two install.sh files (repo-root + website-v2/public/) must
+# be byte-identical. The site serves website-v2/public/install.sh and
+# `railcall update` fetches the repo-root copy via GitHub raw. If they drift,
+# existing operators' `railcall update` hits a scary integrity error the next
+# time we cut a station release (this actually happened in the v0.44 cut).
+#
+# To install: git config --local core.hooksPath .githooks
+# One-time per clone. See CONTRIBUTING.md or run ./scripts/setup-hooks.sh.
+#
+# CI also runs the same check via qa/run.sh step 2b, so a bypass with
+# --no-verify still gets caught before merge. This hook just fails fast
+# on the operator's machine so they don't waste a push.
+
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+A="$ROOT/install.sh"
+B="$ROOT/website-v2/public/install.sh"
+
+if [ ! -f "$A" ] || [ ! -f "$B" ]; then
+  # One of the files is missing — not necessarily a drift issue, could be
+  # a legitimate delete. Let the commit proceed; qa/run.sh will catch it.
+  exit 0
+fi
+
+if ! diff -q "$A" "$B" >/dev/null 2>&1; then
+  cat <<EOF >&2
+✗ install.sh drift detected — the two copies are NOT identical:
+
+  A: install.sh                        (railcall update fetches via GitHub raw)
+  B: website-v2/public/install.sh      (served by railcall.ai)
+
+Diff (first 20 lines):
+$(diff -u "$A" "$B" 2>&1 | head -20)
+
+Fix: cp website-v2/public/install.sh install.sh
+  (the site copy is authoritative — it's the one you're pinning to a new
+   STATION_SHA during a station cut. Keep it as source of truth and
+   mirror it to the repo root.)
+
+If you MUST commit anyway (rare — usually only during a deliberate
+reorg of the installer contract), run:
+  git commit --no-verify
+
+CI will still catch it (qa/run.sh step 2b), so --no-verify only lets
+you push the commit locally; the PR check will red.
+
+EOF
+  exit 1
+fi
+
+exit 0
