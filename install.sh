@@ -23,7 +23,7 @@ RC_BIN="$RC_HOME/bin"
 RC_CONF="$HOME/.config/railcall"
 FILES="railcall_cli.py railcall_companion_daemon.py vault_io.py receipt_signer.py railcall_vault_drivers.py"
 GOVERNANCE_FILES="governance/__init__.py governance/policy_engine.py governance/policy_schema.py governance/receipt_v2.py governance/defaults/__init__.py governance/defaults/governance.default.yml"
-STATION_SHA="aa43091ccf7a6c5c6563d4269a8aa8efca4e84397135a611a9677cd16949c633"
+STATION_SHA="089fc94e62400bccb8a98cea3636691dccfef1be2c528cd9fa54fa29b897117a"
 
 # Full disclosure BEFORE the first write — everything this installer touches, up front:
 echo -e "${BLUE}This installer writes to:${NC}"
@@ -80,7 +80,7 @@ LOCAL_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)" || LOCAL_DIR=""
 # then paste the printed lines over the case arms in pin_for() below.
 pin_for() {
     case "$1" in
-        railcall_cli.py)                          echo b40e494cfc4dd6fdabb2a3fedd6202d039e486e42c8b26a883a020b927533663 ;;
+        railcall_cli.py)                          echo b24032ebb84e4dc45461ab6884e591b3050a30b34f654bdd905f582ebf5e5997 ;;
         railcall_companion_daemon.py)             echo f6a43720157612adbc73723115166fbe3acf8e43f0113ea717cca27b9990a1b5 ;;
         vault_io.py)                              echo 17b0e644a93c773d3f7b5e5e8b046ea39472364b532b545846f3c617433792f8 ;;
         receipt_signer.py)                        echo 36b84579880db9bf78c9bc21cd40c6976094ae8ea978c939f2feef4f97041b9e ;;
@@ -131,13 +131,23 @@ pin_ok() {
 # body is refused by the pin. No fallback sources.
 fetch_valid() {
     f="$1"; dest="$RC_HOME/$f"; LAST_PIN_FAIL=""
+    # Atomic-ish updates: fetch to a temp path, only mv into $dest AFTER
+    # pin_ok passes. Without this a `railcall update` that catches the
+    # release mid-propagation (install.sh has new pin, GitHub raw / mirror
+    # still serving old bytes) would rm the good local copy and leave the
+    # machine with no CLI, breaking every subsequent invocation. The
+    # temp copy is always cleaned up.
+    tmp="${dest}.new.$$"
     if [ -n "$LOCAL_DIR" ] && [ -s "$LOCAL_DIR/$f" ] && "$PY" -m py_compile "$LOCAL_DIR/$f" 2>/dev/null; then
         if pin_ok "$f" "$LOCAL_DIR/$f"; then
+            mkdir -p "$(dirname "$dest")"
             cp "$LOCAL_DIR/$f" "$dest"; echo -e "${GREEN}  ✓ $f${BLUE} (local checkout)${NC}"; return 0
         fi
     fi
     for base in "$RAW_BASE" "$MIRROR_BASE"; do
-        if fetch "$base/$f" "$dest" 2>/dev/null && [ -s "$dest" ] && "$PY" -m py_compile "$dest" 2>/dev/null && pin_ok "$f" "$dest"; then
+        mkdir -p "$(dirname "$tmp")"
+        if fetch "$base/$f" "$tmp" 2>/dev/null && [ -s "$tmp" ] && "$PY" -m py_compile "$tmp" 2>/dev/null && pin_ok "$f" "$tmp"; then
+            mv -f "$tmp" "$dest"
             if [ "$base" = "$MIRROR_BASE" ]; then
                 echo -e "${GREEN}  ✓ $f${BLUE} (via railcall.ai — your network altered the GitHub copy)${NC}"
             else
@@ -145,8 +155,16 @@ fetch_valid() {
             fi
             return 0
         fi
-        rm -f "$dest"
+        rm -f "$tmp"
     done
+    # Reached here only when EVERY source failed. If a good copy already
+    # exists at $dest (upgrade path from a previous successful install),
+    # keep it — a partial-release race must never take down a working
+    # install. The caller still returns non-zero so the operator sees a
+    # clear "could not update" message.
+    if [ -s "$dest" ]; then
+        echo -e "${BLUE}  · $f — keeping existing verified copy; update deferred${NC}"
+    fi
     return 1
 }
 
@@ -223,12 +241,18 @@ else
 fi
 
 # ---- Studio (the visual builder) — fetch + unpack the station bundle (one-time, ~22MB) ----
-STATION_URL="https://github.com/patl4588/railcall-core/releases/download/station-v0.28/railcall_station.tar.gz"
+STATION_URL="https://github.com/patl4588/railcall-core/releases/download/station-v0.44/railcall_station.tar.gz"
 # Mirror on our own origin. The tarball had ONE source, so a network that rewrites or
 # blocks github.com failed the install outright even after the CLI files recovered.
 # STATION_SHA is enforced identically on whichever source answers, so the mirror cannot
 # substitute a different bundle.
-STATION_URL_MIRROR="https://railcall.ai/railcall_station.tar.gz"
+#
+# ?v=$STATION_SHA is a cache-buster — some middleboxes (edge caches, ISP
+# proxies) hold onto the URL for hours even when we set Cache-Control:
+# max-age=0 on the response. Baking the pinned SHA into the query string
+# makes every release a distinct URL so a stale copy from an older
+# release can never be served under this version's key.
+STATION_URL_MIRROR="https://railcall.ai/railcall_station.tar.gz?v=$STATION_SHA"
 STATION_DIR="$RC_HOME/station"
 echo -e "${BLUE}Downloading the RailCall Studio (one-time, ~22MB) ...${NC}"
 station_get() {
@@ -247,10 +271,16 @@ station_get() {
         echo -e "${RED}  ✗ local station bundle sha mismatch — falling back to network${NC}"
     fi
     for u in "$STATION_URL" "$STATION_URL_MIRROR"; do
-        fetch "$u" "$RC_HOME/station.tar.gz" || continue
+        # 2>/dev/null suppresses curl's own "404" chatter on the first
+        # source — the mirror is the normal recovery path (GitHub release
+        # tags trail behind the pinned STATION_URL for a few days after
+        # each cut), so a stderr leak from the first attempt reads to the
+        # user as a broken install even when the second attempt succeeds.
+        # If BOTH sources fail we emit a clear message below.
+        fetch "$u" "$RC_HOME/station.tar.gz" 2>/dev/null || continue
         a=$(sha256_of "$RC_HOME/station.tar.gz")
         if [ "$a" = "$STATION_SHA" ]; then
-            [ "$u" = "$STATION_URL_MIRROR" ] && echo -e "${BLUE}  · fetched via railcall.ai (GitHub was unreachable or altered)${NC}"
+            [ "$u" = "$STATION_URL_MIRROR" ] && echo -e "${BLUE}  · fetched via railcall.ai (GitHub release not yet uploaded for this pin)${NC}"
             return 0
         fi
         STATION_GOT="$a"
@@ -375,7 +405,7 @@ if [ -z "${RAILCALL_NO_TELEMETRY:-}" ]; then
         # regardless — a marketplace outage does NOT block a user install.
         curl -fsS --max-time 3 -o /dev/null \
             -X POST -H "Content-Type: application/json" \
-            -d "{\"machine_id\":\"$MID\",\"version\":\"0.28.0\",\"station_sha\":\"$STATION_SHA\",\"os\":\"$OS\",\"arch\":\"$ARCH\"}" \
+            -d "{\"machine_id\":\"$MID\",\"version\":\"0.40.0\",\"station_sha\":\"$STATION_SHA\",\"os\":\"$OS\",\"arch\":\"$ARCH\"}" \
             "https://railcall-marketplace-lggm.onrender.com/telemetry/station-install" \
             2>/dev/null || true
     fi
