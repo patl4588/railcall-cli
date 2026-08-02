@@ -5161,6 +5161,15 @@ def _market_publish_module(args):
 
     # Listing payload — three fields, all strings. The marketplace validator
     # (listings.service.ts validatePayloadForType) enforces the shape.
+    # For v2 (below), handler_py is dropped after the tarball is attached —
+    # it's already inside module_files_b64, and the server (marketplace
+    # commit ecd6b32+) unpacks it back into the payload before validation.
+    # Saves ~68 KiB per publish on a real module. module_json stays because
+    # it's small (~25 KiB typical) and used everywhere for pre-unpack
+    # validation. The 3-field v1 shape below is what OLDER servers see —
+    # for v2 publishes to a server that hasn't picked up the extract
+    # helper yet, sending handler_py keeps them working; the v2 branch
+    # trims it after size is verified there.
     payload = {
         "module_json": manifest_text,
         "handler_py": handler_text,
@@ -5224,6 +5233,16 @@ def _market_publish_module(args):
             return 1
         payload["module_files_b64"] = _base64.b64encode(raw).decode("ascii")
         payload["manifest_version"] = 2
+        # Drop the plaintext handler_py — it's already inside the tarball
+        # above. The server (marketplace ecd6b32+) unpacks it back into
+        # the payload before validation. ~68 KiB saved per publish on a
+        # real module. module_json stays (small, and older servers use it
+        # unconditionally for shape validation). Env override
+        # RAILCALL_PUBLISH_KEEP_PLAINTEXT=1 keeps the pre-dedup shape for
+        # publishers stuck on a server that hasn't picked up the extract
+        # helper yet.
+        if os.environ.get("RAILCALL_PUBLISH_KEEP_PLAINTEXT") != "1":
+            payload.pop("handler_py", None)
 
     # Pre-flight the marketplace's quality gate — catches shell modules
     # (empty commands, missing handler functions, trivial handler.py,
