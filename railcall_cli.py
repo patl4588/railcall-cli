@@ -5233,24 +5233,34 @@ def _market_publish_module(args):
             return 1
         payload["module_files_b64"] = _base64.b64encode(raw).decode("ascii")
         payload["manifest_version"] = 2
-        # Drop the plaintext handler_py — it's already inside the tarball
-        # above. The server (marketplace ecd6b32+) unpacks it back into
-        # the payload before validation. ~68 KiB saved per publish on a
-        # real module. module_json stays (small, and older servers use it
-        # unconditionally for shape validation). Env override
-        # RAILCALL_PUBLISH_KEEP_PLAINTEXT=1 keeps the pre-dedup shape for
-        # publishers stuck on a server that hasn't picked up the extract
-        # helper yet.
-        if os.environ.get("RAILCALL_PUBLISH_KEEP_PLAINTEXT") != "1":
-            payload.pop("handler_py", None)
+        # NB: handler_py dedup happens AFTER the lint pre-flight below —
+        # the marketplace's /listings/lint endpoint reads payload.handler_py
+        # to check `module.handler_missing`, and doesn't (yet) unpack the
+        # tarball itself. Dropping handler_py before the lint made every
+        # v2 module publish fail with `module.handler_missing` regardless
+        # of what handler.py actually contained — task #213.
 
     # Pre-flight the marketplace's quality gate — catches shell modules
     # (empty commands, missing handler functions, trivial handler.py,
     # command_missing_title, etc.) before signing. Same rationale as
     # workflow publish: don't waste a signature + throttle slot on
     # something the server would 400 anyway.
+    # MUST run BEFORE the handler_py dedup below — see task #213 note above.
     if not _market_lint_preflight(listing_type, payload, description, price_cents):
         return 1
+
+    # Handler_py dedup (task #185) — was default-ON, now default-OFF
+    # because the live marketplace's server-side unpack helper isn't
+    # in place; publishing with the tarball alone returns
+    # `HTTP 400: handler.py not found inside`. Opt-in via
+    # RAILCALL_PUBLISH_DEDUP_HANDLER=1 once your server is confirmed
+    # to have the extract helper. The env is checked with fnmatch to
+    # honor both the new opt-in name AND the legacy KEEP_PLAINTEXT=1
+    # flag (which meant "don't dedup"). Task #213.
+    _dedup_optin = os.environ.get("RAILCALL_PUBLISH_DEDUP_HANDLER", "").lower() in ("1", "true", "yes", "on")
+    _legacy_keep = os.environ.get("RAILCALL_PUBLISH_KEEP_PLAINTEXT", "").lower() in ("1", "true", "yes", "on")
+    if "module_files_b64" in payload and _dedup_optin and not _legacy_keep:
+        payload.pop("handler_py", None)
 
     # Sign the LISTING — same recipe workflow/policy_pack/prompt_library use.
     # (This is a DIFFERENT signature from module.sig — that one covers the
