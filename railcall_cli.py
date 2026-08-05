@@ -3231,7 +3231,7 @@ _VERSION_CLI_FILES = [
     "governance/defaults/__init__.py",
     "governance/defaults/governance.default.yml",
 ]
-_VERSION_INSTALL_SH_URL = "https://raw.githubusercontent.com/patl4588/railcall-core/main/install.sh"
+_VERSION_INSTALL_SH_URL = "https://raw.githubusercontent.com/patl4588/railcall-cli/main/install.sh"
 
 
 def _version_fetch_main_pins(timeout=3.0):
@@ -3395,7 +3395,7 @@ def cmd_version(_=None):
     # ── Provenance + fix hint ────────────────────────────────────────────────
     lines.append("")
     if remote_pins:
-        lines.append(c("pinned by  ", "dim") + c("install.sh @ patl4588/railcall-core/main", "slate"))
+        lines.append(c("pinned by  ", "dim") + c("install.sh @ patl4588/railcall-cli/main", "slate"))
     else:
         lines.append(c("pinned by  ", "dim") + c("(unreachable — network down or GitHub blocked)", "amber"))
 
@@ -3403,7 +3403,7 @@ def cmd_version(_=None):
     if is_drift:
         lines.append("")
         lines.append(c("fix  ", "dim") +
-                     c("curl -fsSL https://raw.githubusercontent.com/patl4588/railcall-core/main/install.sh | bash", "cyan"))
+                     c("curl -fsSL https://raw.githubusercontent.com/patl4588/railcall-cli/main/install.sh | bash", "cyan"))
 
     ok = bool(remote_pins) and not drift and not missing and station_ok
     label = "Latest" if ok else ("Out of date" if remote_pins else "Offline check")
