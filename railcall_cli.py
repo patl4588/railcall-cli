@@ -638,6 +638,7 @@ def cmd_dashboard(_=None):
         c("daemon", "cyan") + "             start loopback daemon on 127.0.0.1:8555",
         c("health", "cyan") + "             daemon + socket-audit status",
         c("doctor", "cyan") + "             check the local environment (PASS/WARN/FAIL + the exact fix)",
+        c("scheduler", "cyan") + "          run scheduled workflows with Studio closed",
         c("balance", "cyan") + "            live run balance from the gateway",
         c("login", "cyan") + c(" <key>", "dim") + "        save your rc_live_ key, then verify",
         c("rotate-key", "cyan") + "         mint a fresh Ed25519 signing key (archives the old public key)",
@@ -970,6 +971,41 @@ def cmd_health(_=None):
     print(panel(lines, title="RAILCALL · health", color="cyan"))
     print(footer(ok=(ext == 0)))
     return 0
+
+
+
+def cmd_scheduler(args):
+    """Drive scheduled workflows from outside Studio.
+
+    v0.62. Studio runs its own clock, so this is only needed when you want
+    schedules to keep firing with Studio CLOSED — a server, an always-on
+    machine, or a laptop where you would rather not leave the UI open.
+
+    It does exactly one thing on a timer: ask the station "is anything due?".
+    The station decides what may run; this process cannot create a schedule,
+    change a disposition, or widen a policy — its token authenticates the tick
+    endpoint and nothing else.
+    """
+    import importlib.util
+    driver = os.path.expanduser("~/.railcall/station/workbench/scheduler_driver.py")
+    if not os.path.isfile(driver):
+        print(c("scheduler driver not found", "red"))
+        print("  expected: " + driver)
+        print("  run `railcall update` to fetch a station that includes it (v0.61+).")
+        return 1
+    spec = importlib.util.spec_from_file_location("scheduler_driver", driver)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    argv = []
+    if getattr(args, "once", False):
+        argv.append("--once")
+    if getattr(args, "dry_run", False):
+        argv.append("--dry-run")
+    if getattr(args, "interval", None):
+        argv += ["--interval", str(args.interval)]
+    if getattr(args, "port", None):
+        argv += ["--port", str(args.port)]
+    return mod.main(argv)
 
 
 def cmd_doctor(_=None):
@@ -5300,6 +5336,24 @@ def _market_publish_module(args):
     if authorized:
         submission["authorized_buyer_ids"] = [b.strip() for b in authorized.split(",") if b.strip()]
 
+    # --dry-run was accepted and SILENTLY IGNORED on this path: the flag parsed
+    # fine, the POST went out anyway, and the panel said "Module published."
+    # A preview flag that performs the real action is worse than no flag —
+    # anyone testing a publish shipped one instead. (Found by using it.)
+    if any(a in ("--dry-run", "--dry_run", "--dryrun") for a in args[1:]):
+        print(panel([c("DRY RUN — nothing was sent to the marketplace.", "cyan"),
+                     c("id:       ", "slate") + str(listing_id),
+                     c("version:  ", "slate") + str(version),
+                     c("type:     ", "slate") + str(listing_type),
+                     c("price:    ", "slate") + f"{price_cents} cents",
+                     c("commands: ", "slate") + ", ".join(
+                         str(cc.get("id")) for cc in (manifest.get("commands") or [])),
+                     c("payload:  ", "slate") + f"{len(canonical)} bytes, sha256 {payload_sha[:16]}…",
+                     c("", "slate"),
+                     c("Re-run without --dry-run to publish.", "dim")],
+                    title="RAILCALL · publish · module · DRY RUN", color="cyan"))
+        return 0
+
     code, resp = _marketplace_authed_request("POST", "/listings", submission)
     if code == 201 and resp:
         _final_id = resp.get("slug") or resp.get("id") or listing_id
@@ -6459,7 +6513,7 @@ def cmd_connect(args=None):
 
 COMMANDS = {"build": cmd_build, "interpret": cmd_interpret, "daemon": cmd_daemon,
             "start-daemon": cmd_daemon, "health": cmd_health, "dashboard": cmd_dashboard,
-            "doctor": cmd_doctor, "demo": cmd_demo, "rotate-key": cmd_rotate_key,
+            "doctor": cmd_doctor, "scheduler": cmd_scheduler, "demo": cmd_demo, "rotate-key": cmd_rotate_key,
             "balance": cmd_balance, "login": cmd_login, "studio": cmd_studio, "audit": cmd_audit,
             "verify": cmd_verify, "receipts": cmd_receipts, "backup": cmd_backup, "restore": cmd_restore,
             "backup-verify": cmd_backup_verify, "set": cmd_set, "workflow": cmd_workflow,
