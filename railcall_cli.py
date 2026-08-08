@@ -1991,6 +1991,108 @@ def _install_pubkey():
     return None
 
 
+# The RailCall identity issuer PUBLIC key, baked in (Security C). Verifying the
+# identity credential needs only this public half — it can forge nothing, which
+# is why it ships in the signed CLI. An auditor who trusts THIS binary (signed
+# distribution) can verify a customer's receipt end-to-end with no call to
+# railcall.ai — closing the "who verifies the verifier?" gap: a swapped web
+# verifier is irrelevant when the check runs in the CLI they already trust.
+#
+# Cross-check this fingerprint against an independent channel (the station
+# tarball, the /security page, a pinned announcement). If they disagree, someone
+# swapped a key — stop.
+_IDENTITY_ISSUER_PUBKEY = "115848158070a52798e1045f364ea235c51a496304a05f56719ac5a8a09902aa"
+_IDENTITY_SIGNED_FIELDS = ("schema", "station_pubkey", "subject",
+                           "issued_at", "expires_at", "issuer_key_id")
+
+
+def _receipt_created_at(receipt):
+    """Best-effort ISO creation time, matching the web verifier's probe order."""
+    wf = receipt.get("workflow_receipt") or {}
+    ap = receipt.get("approval") or {}
+    for v in (wf.get("emitted_at"), ap.get("timestamp"), receipt.get("emitted_at"),
+              receipt.get("created_at"), receipt.get("timestamp_utc"), receipt.get("ts")):
+        if isinstance(v, str) and v:
+            return v
+    return None
+
+
+def _verify_identity_credential(receipt, signing_pubkey_hex, explain=False):
+    """Verify the SECOND signature — the issuer-signed identity credential — fully
+    offline against the baked-in issuer key. Returns a list of display lines
+    (empty if no credential). Never raises across the trust boundary.
+
+    Checks, in order: (1) the credential's issuer signature verifies against
+    _IDENTITY_ISSUER_PUBKEY; (2) it names the SAME station key that signed this
+    receipt (else it is a bearer token stapled to someone else's receipt);
+    (3) the receipt was created while the credential was valid (temporal binding —
+    a departed employee's old receipt stays authentic)."""
+    def ex(msg):
+        if explain:
+            print(c("  · " + msg, "dim"))
+    actor = receipt.get("actor") or {}
+    si = actor.get("station_identity") or {}
+    cred = si.get("credential")
+    if not isinstance(cred, dict):
+        return [c("identity  not linked — receipt is authentic but anonymous "
+                  "(no RailCall-issued credential rode along)", "slate")]
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        from cryptography.exceptions import InvalidSignature
+    except Exception:
+        return [c("identity  credential present but `cryptography` "
+                  "unavailable to check it", "amber")]
+
+    body = {k: cred.get(k) for k in _IDENTITY_SIGNED_FIELDS}
+    canon = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    issuer_ok = False
+    try:
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(_IDENTITY_ISSUER_PUBKEY)).verify(
+            bytes.fromhex(str(cred.get("signature", ""))), canon)
+        issuer_ok = True
+    except InvalidSignature:
+        issuer_ok = False
+    except Exception:
+        issuer_ok = False
+    ex("identity: issuer signature (key %s…) → %s"
+       % (_IDENTITY_ISSUER_PUBKEY[:12], "VALID" if issuer_ok else "INVALID"))
+
+    cred_station = str(cred.get("station_pubkey") or "").lower()
+    bound = bool(signing_pubkey_hex) and cred_station == str(signing_pubkey_hex).lower()
+    ex("identity: credential station_pubkey == receipt signer → %s" % ("YES" if bound else "NO"))
+
+    created = _receipt_created_at(receipt)
+    in_window = None
+    if created and cred.get("issued_at") and cred.get("expires_at"):
+        in_window = str(cred["issued_at"]) <= str(created) <= str(cred["expires_at"])
+        ex("identity: %s in [%s, %s] → %s"
+           % (created, cred["issued_at"], cred["expires_at"], in_window))
+
+    subj = cred.get("subject") or {}
+    who = subj.get("display_name") or subj.get("email") or "account"
+    org = subj.get("org_name")
+    label = who + (" · " + org if org else "") + (" (" + subj["role"] + ")" if subj.get("role") else "")
+
+    lines = []
+    if issuer_ok and bound and in_window is not False:
+        lines.append(c("✓ IDENTITY ATTESTED", "green") + c("   " + label, "slate"))
+        lines.append(c("identity  RailCall-issued credential, signed by the issuer key "
+                       "and bound to the signing station", "slate"))
+        if created and cred.get("expires_at"):
+            lines.append(c("attested  " + created + "   credential valid then "
+                           "(to " + str(cred.get("expires_at")) + ")", "slate"))
+        lines.append(c("note  proves WHOSE station produced this — not that a specific human "
+                       "was at the keyboard. Current revocation status is an ONLINE check.", "slate"))
+    else:
+        why = ("issuer signature invalid" if not issuer_ok
+               else "credential names a DIFFERENT station than signed this receipt" if not bound
+               else "receipt was created OUTSIDE the credential's validity window")
+        lines.append(c("✗ IDENTITY NOT VERIFIED", "red") + c("   " + why, "slate"))
+    lines.append(c("issuer fp", "dim") + "  " + _IDENTITY_ISSUER_PUBKEY[:32] + "…  "
+                 + c("(cross-check against the /security page + station tarball)", "slate"))
+    return lines
+
+
 def _verify_studio_receipt(receipt, path, user_key=None, explain=False):
     """Verify a Studio/workflow receipt: its 'signature' block signs the integrity field STRING
     (integrity_hash for builds, integrity for runs, integrity_root for workflow receipts), checked
@@ -2005,6 +2107,26 @@ def _verify_studio_receipt(receipt, path, user_key=None, explain=False):
     # receipts carry integrity_root — same precedence as the routing check.
     ih_field = next((k for k in ("integrity_hash", "integrity", "integrity_root") if receipt.get(k)), None)
     ih = receipt.get(ih_field) if ih_field else None
+    # For DAG-run receipts the integrity_hash covers the body; the signature then
+    # covers that hash STRING. Verifying only the signature would pass a receipt
+    # whose BODY was edited but whose hash field left stale — so recompute the
+    # hash from the body first (Security C: match the web verifier's two-step).
+    # Canonical = sort_keys + minimal separators + ensure_ascii (default True),
+    # byte-identical to the station's json.dumps and the /verify page.
+    if str(receipt.get("schema", "")).startswith("railcall_workflow_dagrun_receipt") and ih:
+        _body = {k: v for k, v in receipt.items()
+                 if k not in ("signature", "integrity_hash", "ok") and not str(k).startswith("_")}
+        _recomputed = "sha256:" + hashlib.sha256(
+            json.dumps(_body, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        ex("dagrun hash recompute: %s vs claimed %s"
+           % (_recomputed[:24] + "…", str(ih)[:24] + "…"))
+        if _recomputed != ih:
+            print(panel([c("✗ RECEIPT ALTERED", "red"),
+                         c("  The body no longer matches its integrity_hash — edited after sealing.", "slate"),
+                         c("  recomputed " + _recomputed[:32] + "…", "slate"),
+                         c("  claimed    " + str(ih)[:32] + "…", "slate")],
+                        title="RAILCALL · verify", color="red"))
+            print(footer(ok=False)); return 1
     key_id = sb.get("key_id"); alg = sb.get("alg", "ed25519")
     net = receipt.get("network_audit") or {}
     ext = net.get("external_sockets_open")
@@ -2064,6 +2186,14 @@ def _verify_studio_receipt(receipt, path, user_key=None, explain=False):
     if ext is not None:
         lines.append((c("airlock ✓", "green") if ext == 0 else c("airlock ✗", "red")) +
                      c("   %s external sockets recorded during the run" % ext, "slate"))
+    # Second signature: the issuer-signed identity credential (Security C). Runs
+    # fully offline against the baked-in issuer key, so an auditor holding this
+    # signed CLI verifies WHOSE station AND that the record is authentic — with
+    # no call to railcall.ai.
+    id_lines = _verify_identity_credential(receipt, doc.get("public_key_hex"), explain=explain)
+    if id_lines:
+        lines.append("")
+        lines.extend(id_lines)
     lines.append("")
     if key_src:
         lines.append(c("Verified against a USER-SUPPLIED key (--key " + key_src + ") — explicit trust,", "dim"))
