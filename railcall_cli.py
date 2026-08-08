@@ -2044,7 +2044,13 @@ def _verify_identity_credential(receipt, signing_pubkey_hex, explain=False):
                   "unavailable to check it", "amber")]
 
     body = {k: cred.get(k) for k in _IDENTITY_SIGNED_FIELDS}
-    canon = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    # ensure_ascii=FALSE — literal UTF-8, matching the marketplace issuer's
+    # JSON.stringify. Security G: with the default (True) a non-ASCII subject
+    # name would verify over \u-escaped bytes the issuer never signed → false
+    # FAIL. The credential recipe is literal; the DAG-run receipt recipe is
+    # escaped. Two objects, two recipes (canonical-form.md).
+    canon = json.dumps(body, sort_keys=True, separators=(",", ":"),
+                       ensure_ascii=False, default=str).encode("utf-8")
     issuer_ok = False
     try:
         Ed25519PublicKey.from_public_bytes(bytes.fromhex(_IDENTITY_ISSUER_PUBKEY)).verify(
