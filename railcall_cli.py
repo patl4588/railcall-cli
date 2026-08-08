@@ -2186,6 +2186,18 @@ def _verify_studio_receipt(receipt, path, user_key=None, explain=False):
     if ext is not None:
         lines.append((c("airlock ✓", "green") if ext == 0 else c("airlock ✗", "red")) +
                      c("   %s external sockets recorded during the run" % ext, "slate"))
+    # Security D: show the replay chain if present (sealed run_id + sequence +
+    # prev-run-hash). One receipt can't prove non-replay alone, but surfacing the
+    # chain lets an auditor holding several spot a repeated run_id or a broken
+    # sequence — replay or a rolled-back/forked history.
+    if receipt.get("run_id") or receipt.get("sequence_number") is not None:
+        prevd = (str(receipt.get("prev_run_hash"))[:20] + "…") if receipt.get("prev_run_hash") else "genesis (first run)"
+        lines.append(c("run  #%s   id %s   prev %s"
+                       % (receipt.get("sequence_number", "?"),
+                          str(receipt.get("run_id", ""))[:12], prevd), "slate"))
+        lines.append(c("     replay-evident: a repeated run_id or broken prev-hash across "
+                       "receipts = replay / rollback", "dim"))
+
     # Second signature: the issuer-signed identity credential (Security C). Runs
     # fully offline against the baked-in issuer key, so an auditor holding this
     # signed CLI verifies WHOSE station AND that the record is authentic — with
