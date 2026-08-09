@@ -2017,6 +2017,92 @@ def _receipt_created_at(receipt):
     return None
 
 
+def _verify_team_approval(receipt, explain=False):
+    """Verify the Teams-mesh co-signature block (T3) — fully offline, fully
+    self-contained: the block embeds the team manifest it was verified under.
+
+    Chain: (1) manifest root signature + team_id-derives-from-root binding;
+    (2) block binds to THIS receipt's delta_integrity; (3) every approval
+    signature verifies over the frozen decision bytes; (4) every signer holds
+    'approver' in the embedded manifest; (5) distinct approvers >= quorum.
+    Returns display lines; empty list when the receipt carries no block.
+    Never raises across the trust boundary."""
+    def ex(msg):
+        if explain:
+            print(c("  · " + msg, "dim"))
+    block = receipt.get("team_approval")
+    if not isinstance(block, dict):
+        return []
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        from cryptography.exceptions import InvalidSignature
+    except Exception:
+        return [c("team  approval block present but `cryptography` unavailable to check it", "amber")]
+    import hashlib as _hl
+
+    def _ed_ok(pub_hex, sig_hex, msg_bytes):
+        try:
+            Ed25519PublicKey.from_public_bytes(bytes.fromhex(pub_hex)).verify(
+                bytes.fromhex(sig_hex), msg_bytes)
+            return True
+        except (InvalidSignature, Exception):
+            return False
+
+    def fail(why):
+        return [c("✗ TEAM APPROVAL NOT VERIFIED", "red") + c("   " + why, "slate")]
+
+    manifest = block.get("manifest")
+    if not isinstance(manifest, dict):
+        return fail("no manifest embedded in the block")
+    root_pub = str(manifest.get("root_pubkey") or "").lower()
+    derived = "tm_" + _hl.sha256(bytes.fromhex(root_pub)).hexdigest()[:16] if len(root_pub) == 64 else ""
+    if manifest.get("team_id") != derived:
+        return fail("manifest team_id does not derive from its root key")
+    mbody = {k: v for k, v in manifest.items() if k != "sig"}
+    if not _ed_ok(root_pub, str(manifest.get("sig") or ""), _canonical_json_bytes(mbody)):
+        return fail("manifest root signature invalid")
+    ex("team: manifest v%s root sig → VALID (root %s…)" % (manifest.get("version"), root_pub[:12]))
+
+    action_hash = receipt.get("delta_integrity") or receipt.get("integrity_hash")
+    if block.get("action_hash") != action_hash:
+        return fail("block is signed over DIFFERENT action bytes than this receipt")
+    ex("team: block action_hash == receipt delta_integrity → YES")
+
+    approvers = {str(m.get("pubkey", "")).lower(): m for m in manifest.get("members", [])
+                 if "approver" in (m.get("roles") or [])}
+    req_id = str(block.get("request_envelope_id") or "")
+    seen, names = set(), []
+    for a in (block.get("approvals") or []):
+        pub = str(a.get("pubkey", "")).lower()
+        if pub in seen:
+            continue
+        m = approvers.get(pub)
+        if not m:
+            return fail("signer %s… is not an approver in the embedded manifest" % pub[:16])
+        dbytes = _canonical_json_bytes({
+            "action_hash": action_hash,
+            "request_envelope_id": req_id,
+            "decision": "approve",
+        })
+        if not _ed_ok(pub, str(a.get("decision_sig") or ""), dbytes):
+            return fail("approval signature from %s… invalid" % pub[:16])
+        seen.add(pub)
+        names.append(m.get("display_name") or pub[:12])
+        ex("team: approval sig from %s → VALID" % (m.get("display_name") or pub[:12]))
+    quorum = int(block.get("quorum") or 1)
+    if len(seen) < quorum:
+        return fail("only %d valid approval(s), quorum is %d" % (len(seen), quorum))
+
+    lines = [c("✓ TEAM APPROVED", "green")
+             + c("   %s (%d-of-%d quorum)" % (", ".join(names), len(seen), quorum), "slate")]
+    lines.append(c("team  each signature was made on the named approver's OWN station, over "
+                   "these exact action bytes — not a button click in a shared web app", "slate"))
+    lines.append(c("note  valid under team manifest v%s; whether that roster is still "
+                   "current is an ONLINE check (same split as station revocation)"
+                   % manifest.get("version"), "slate"))
+    return lines
+
+
 def _verify_identity_credential(receipt, signing_pubkey_hex, explain=False):
     """Verify the SECOND signature — the issuer-signed identity credential — fully
     offline against the baked-in issuer key. Returns a list of display lines
@@ -2212,6 +2298,10 @@ def _verify_studio_receipt(receipt, path, user_key=None, explain=False):
     if id_lines:
         lines.append("")
         lines.extend(id_lines)
+    team_lines = _verify_team_approval(receipt, explain=explain)
+    if team_lines:
+        lines.append("")
+        lines.extend(team_lines)
     lines.append("")
     if key_src:
         lines.append(c("Verified against a USER-SUPPLIED key (--key " + key_src + ") — explicit trust,", "dim"))
