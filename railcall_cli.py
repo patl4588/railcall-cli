@@ -5246,6 +5246,7 @@ def _market_install_from_path(args):
     raw_id = str(manifest.get("id") or os.path.basename(module_dir))
     # Same sanitization the marketplace install path uses — "handle/name"
     # becomes a flat "handle-name" directory the loader scans.
+    import re as _re
     slug = _re.sub(r"[^A-Za-z0-9._-]", "-", raw_id)[:120].strip("_-.") or "module"
     dest = os.path.join(os.path.expanduser("~/.railcall"), "station", "modules", slug)
 
