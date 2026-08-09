@@ -5216,6 +5216,96 @@ def _market_module_sign(args):
     return 0
 
 
+def _market_install_from_path(args):
+    """`railcall market install --from-path <module-dir>`
+
+    The local-dev loop, one command (community request, task #261 — two
+    contest builders hit the copy+reload dance in the same week):
+      1. offline signature verify (identical to `market module verify` —
+         what the loader will decide, decided BEFORE anything is copied)
+      2. copy the bundle into ~/.railcall/station/modules/<slug>/
+      3. ask the running station to reload + report THIS module's verdict
+         (loaded, or rejected with the loader's exact reason)
+    Station not running? The copy still happened — we say so honestly and
+    point at Studio → Modules → Reload all. Nothing is left half-claimed.
+    """
+    if len(args) < 1:
+        print(panel([c("usage: railcall market install --from-path <module-dir>", "slate")],
+                    title="RAILCALL · install --from-path", color="slate"))
+        return 1
+    module_dir = os.path.normpath(args[0])
+
+    # 1. Offline verify FIRST — a bundle the loader would refuse must not
+    #    land in the modules dir at all.
+    rc = _market_module_verify([module_dir])
+    if rc != 0:
+        print(footer(ok=False, label="not installed — fix the bundle, then re-run"))
+        return rc
+
+    manifest, _t, _h, _s, _e = _module_bundle_read(module_dir)
+    raw_id = str(manifest.get("id") or os.path.basename(module_dir))
+    # Same sanitization the marketplace install path uses — "handle/name"
+    # becomes a flat "handle-name" directory the loader scans.
+    import re as _re
+    slug = _re.sub(r"[^A-Za-z0-9._-]", "-", raw_id)[:120].strip("_-.") or "module"
+    dest = os.path.join(os.path.expanduser("~/.railcall"), "station", "modules", slug)
+
+    # 2. Copy (replace an existing dev copy wholesale — stale files from a
+    #    previous iteration would break the v2 tree signature).
+    import shutil
+    if os.path.isdir(dest):
+        shutil.rmtree(dest)
+    shutil.copytree(module_dir, dest)
+    print(c(f"copied → {dest}", "slate"))
+
+    # 3. Reload the running station + report this module's verdict.
+    port = os.environ.get("STUDIO_PORT", "8799")
+    tok = None
+    try:
+        with open(os.path.join(_station_workspace, "cli_session_token"), encoding="utf-8") as f:
+            tok = f.read().strip()
+    except OSError:
+        pass
+    if not tok:
+        print(panel([c("Installed on disk, but the station isn't running (or pre-v0.68).", "amber"),
+                     c("  Start it (`railcall studio`) → Modules tab → Reload all.", "slate")],
+                    title="RAILCALL · install --from-path", color="amber"))
+        return 0
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/modules/reload",
+            data=b"{}",
+            headers={"Content-Type": "application/json",
+                     "X-RailCall-Session": tok,
+                     "Origin": f"http://127.0.0.1:{port}"},
+            method="POST")
+        with urllib.request.urlopen(req, timeout=20) as r:
+            res = json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        print(panel([c("Installed on disk, but the reload call failed: " + str(e)[:120], "amber"),
+                     c("  Studio → Modules → Reload all will pick it up.", "slate")],
+                    title="RAILCALL · install --from-path", color="amber"))
+        return 0
+    rejected = next((x for x in (res.get("rejected") or [])
+                     if x.get("slug") == slug), None)
+    loaded = slug in (res.get("loaded") or []) or any(
+        (x.get("slug") if isinstance(x, dict) else x) == slug
+        for x in (res.get("loaded") or []))
+    if rejected:
+        print(panel([c("✗ station REJECTED the module:", "red"),
+                     c("  " + str(rejected.get("reason") or "unknown"), "slate"),
+                     c("  (files are at " + dest + " — fix, re-sign, re-run)", "dim")],
+                    title="RAILCALL · install --from-path", color="red"))
+        return 1
+    n_cmds = len(manifest.get("commands") or [])
+    print(panel([c("✓ installed + loaded", "cyan"),
+                 c(f"  {raw_id} — {n_cmds} command(s) registered", "slate"),
+                 c("  run them from Studio's palette (stage → preview → approve → receipt)", "dim")]
+                + ([] if loaded else [c("  note: reload OK; module not named in response — check the Modules tab", "dim")]),
+                title="RAILCALL · install --from-path", color="cyan"))
+    return 0
+
+
 def _market_module_verify(args):
     """`railcall market module verify <module-dir>`
 
@@ -6115,6 +6205,10 @@ def cmd_market(args=None):
     if sub == "get":
         return _market_get(rest)
     if sub == "install":
+        # Local-dev path (task #261): sign-check → copy into the station's
+        # modules dir → reload → verdict. No marketplace round-trip.
+        if rest and rest[0] == "--from-path":
+            return _market_install_from_path(rest[1:])
         return _market_install(rest)
     if sub == "claim":
         return _market_claim(rest)
