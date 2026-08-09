@@ -5317,16 +5317,28 @@ def _market_publish_module(args):
                     title="RAILCALL · publish", color="amber"))
         return 1
 
+    # Accept both --name=value and --name value (community bug, dinkarshweta).
     def flag(name, default=None):
-        for a in args[1:]:
+        aa = args[1:]
+        for i, a in enumerate(aa):
             if a.startswith("--" + name + "="):
                 return a[len(name) + 3:]
+            if a == "--" + name and i + 1 < len(aa) and not aa[i + 1].startswith("--"):
+                return aa[i + 1]
         return default
 
     listing_type = "module"
     listing_id = flag("id") or manifest.get("id")
     title = flag("title") or manifest.get("name") or manifest.get("id") or "module"
-    category = flag("category") or "Ops"
+    # Read the module's own declared category (top-level or credential_spec)
+    # before falling back; None → the marketplace preserves the current category
+    # on republish rather than resetting it to "Ops" (community bug, dinkarshweta).
+    category = (
+        flag("category")
+        or manifest.get("category")
+        or (manifest.get("credential_spec") or {}).get("category")
+        or None
+    )
     price_cents = int(flag("price", "0"))
     version = flag("version") or manifest.get("version") or "v1.0.0"
     description = ""
@@ -5660,16 +5672,34 @@ def _market_publish(args):
         return 1
 
     # Flag parsing
+    # Community bug (dinkarshweta, station-v0.64): flag() matched only
+    # --name=value, so a space-separated `--version v1.1.0` was silently ignored
+    # and the default returned — every flag on this path (--type/--id/--title/
+    # --category/--price/--version) quietly took its default. Accept BOTH forms.
     def flag(name, default=None):
-        for a in args[1:]:
+        aa = args[1:]
+        for i, a in enumerate(aa):
             if a.startswith("--" + name + "="):
                 return a[len(name) + 3:]
+            if a == "--" + name and i + 1 < len(aa) and not aa[i + 1].startswith("--"):
+                return aa[i + 1]
         return default
 
     listing_type = flag("type", "workflow")
     listing_id = flag("id") or spec.get("id") or spec.get("slug")
     title = flag("title") or spec.get("title") or listing_id
-    category = flag("category") or spec.get("category") or "Ops"
+    # Community bug (dinkarshweta): a version bump with no explicit category used
+    # to reset the listing to the "Ops" literal. Read every place a category can
+    # legitimately live (flag, spec, module credential_spec, top-level module
+    # category); only when NONE is present, send null so the marketplace PRESERVES
+    # the currently-published category instead of overwriting it with "Ops".
+    category = (
+        flag("category")
+        or spec.get("category")
+        or (spec.get("credential_spec") or {}).get("category")
+        or spec.get("module_category")
+        or None
+    )
     price_cents = int(flag("price", "0"))
     version = flag("version", "v1.0.0")
     description = ""
