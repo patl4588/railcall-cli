@@ -6819,14 +6819,7 @@ def cmd_team(args=None):
         req = urllib.request.Request(
             base + path,
             data=(json.dumps(body).encode() if body is not None else None),
-            # Origin header: the station's CSRF gate rejects POSTs without an
-            # Origin/Referer (v0.67 live-smoke find, task #262). The CLI is a
-            # legitimate same-machine caller — it authenticates with the 0600
-            # cli_session_token no browser page can read — so it identifies
-            # itself with the loopback origin the gate accepts.
-            headers={"Content-Type": "application/json",
-                     "X-RailCall-Session": tok,
-                     "Origin": base},
+            headers={"Content-Type": "application/json", "X-RailCall-Session": tok},
             method=method,
         )
         try:
