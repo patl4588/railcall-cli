@@ -6689,6 +6689,162 @@ def cmd_connect(args=None):
     return 1
 
 
+def cmd_team(args=None):
+    """Declare and manage a TEAM of stations (Teams-mesh T1).
+
+    A team is a signed document: member station pubkeys + roles, signed by an
+    offline ROOT SEED that `create` prints ONCE and never stores. The Relay
+    distributes the manifest; every station verifies the root signature
+    locally, so the server can never forge membership.
+
+      railcall team show                          current team + your pubkey/roles
+      railcall team create <team-name> <your-name>   mint root seed + manifest v1
+      railcall team add <pubkey> <name> [roles]   add a member (asks for the seed)
+                                                  roles: comma list of
+                                                  owner,approver,operator,worker
+                                                  (default approver,operator)
+      railcall team remove <pubkey>               remove a member (asks for the seed)
+      railcall team join <team_id>                adopt a published team on THIS station
+      railcall team sync                          pull the latest manifest version
+      railcall team leave                         drop the team from this station
+
+    Requires the station running (`railcall studio`) — the ceremony executes
+    there; this command is a thin authenticated wrapper over /api/team/*.
+    """
+    args = args or []
+    sub = args[0] if args else "show"
+
+    port = os.environ.get("STUDIO_PORT", "8799")
+    base = f"http://127.0.0.1:{port}"
+    tok_path = os.path.join(_station_workspace, "cli_session_token")
+    try:
+        with open(tok_path) as f:
+            tok = f.read().strip()
+    except OSError:
+        print(c("station not running (or pre-team version) — start it with: railcall studio", "amber"))
+        print(c(f"  (no CLI session token at {tok_path})", "slate"))
+        return 1
+
+    def api(method, path, body=None):
+        req = urllib.request.Request(
+            base + path,
+            data=(json.dumps(body).encode() if body is not None else None),
+            headers={"Content-Type": "application/json", "X-RailCall-Session": tok},
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            try:
+                return json.loads(e.read().decode())
+            except Exception:
+                return {"ok": False, "error": f"HTTP {e.code}"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:200]}
+
+    def ask_seed():
+        import getpass
+        return getpass.getpass("team root seed (input hidden): ").strip()
+
+    if sub == "show":
+        st = api("GET", "/api/team")
+        if not st.get("ok"):
+            print(c(f"error: {st.get('error')}", "red")); return 1
+        print(c("your station pubkey: ", "slate") + (st.get("own_pubkey") or "?"))
+        if not st.get("in_team"):
+            print(c("not in a team — `railcall team create` or `railcall team join <team_id>`", "slate"))
+            return 0
+        t = st["team"]
+        print(c(f"team {t['name']}  ·  {t['team_id']}  ·  manifest v{t['version']}", "cyan"))
+        for m in t["members"]:
+            you = "  ← you" if m.get("is_self") else ""
+            print(f"  {m['display_name']:<20} {','.join(m['roles']):<32} {m['pubkey'][:16]}…{you}")
+        return 0
+
+    if sub == "create":
+        if len(args) < 3:
+            print(c("usage: railcall team create <team-name> <your-display-name>", "amber")); return 1
+        res = api("POST", "/api/team/create", {"name": args[1], "display_name": args[2]})
+        if not res.get("ok"):
+            print(c(f"error: {res.get('error')}", "red")); return 1
+        print(c(f"team created: {res['team_id']} (manifest v1)", "green"))
+        if res.get("publish_error"):
+            print(c(f"WARNING: relay publish failed ({res['publish_error']}) — teammates can't join yet; retry with `railcall team sync`", "amber"))
+        print()
+        print(c("━" * 64, "red"))
+        print(c("  TEAM ROOT SEED — shown ONCE, stored NOWHERE. Write it down", "red"))
+        print(c("  offline now. It signs every membership change; anyone who", "red"))
+        print(c("  holds it controls the team, and losing it freezes the", "red"))
+        print(c("  member list permanently.", "red"))
+        print(c("━" * 64, "red"))
+        print()
+        print("  " + res["root_seed_hex"])
+        print()
+        print(c(f"teammates join with: railcall team join {res['team_id']}", "slate"))
+        print(c("then add them here:  railcall team add <their-pubkey> <name>", "slate"))
+        return 0
+
+    if sub == "add":
+        if len(args) < 3:
+            print(c("usage: railcall team add <pubkey> <display-name> [roles]", "amber")); return 1
+        roles = [r.strip() for r in (args[3] if len(args) > 3 else "approver,operator").split(",") if r.strip()]
+        res = api("POST", "/api/team/add", {
+            "root_seed_hex": ask_seed(), "pubkey": args[1],
+            "display_name": args[2], "roles": roles,
+        })
+        if not res.get("ok"):
+            print(c(f"error: {res.get('error')}", "red")); return 1
+        print(c(f"member added — manifest v{res['version']} ({res['members']} members)", "green"))
+        if res.get("publish_error"):
+            print(c(f"WARNING: relay publish failed ({res['publish_error']}) — teammates still see the old roster; `railcall team sync` to retry", "amber"))
+        return 0
+
+    if sub == "remove":
+        if len(args) < 2:
+            print(c("usage: railcall team remove <pubkey>", "amber")); return 1
+        res = api("POST", "/api/team/remove", {"root_seed_hex": ask_seed(), "pubkey": args[1]})
+        if not res.get("ok"):
+            print(c(f"error: {res.get('error')}", "red")); return 1
+        print(c(f"member removed — manifest v{res['version']}", "green"))
+        if res.get("publish_error"):
+            # A removal the relay didn't learn about is a LIVE security fact.
+            print(c(f"WARNING: relay publish FAILED ({res['publish_error']}) — other stations still trust the old roster until this publishes. Retry now.", "red"))
+        return 0
+
+    if sub == "join":
+        if len(args) < 2:
+            print(c("usage: railcall team join <team_id>", "amber")); return 1
+        res = api("POST", "/api/team/join", {"team_id": args[1]})
+        if not res.get("ok"):
+            print(c(f"error: {res.get('error')}", "red")); return 1
+        print(c(f"adopted {args[1]} (manifest v{res['version']})", "green"))
+        if res.get("you_are_member"):
+            print(c(f"you are a member — roles: {', '.join(res['your_roles'])}", "green"))
+        else:
+            print(c("this station holds the team doc but is NOT a member yet —", "amber"))
+            print(c("send the owner your pubkey (`railcall team show`) so they can add you", "amber"))
+        return 0
+
+    if sub == "sync":
+        res = api("POST", "/api/team/sync", {})
+        if not res.get("ok"):
+            print(c(f"error: {res.get('error')}", "red")); return 1
+        print(c(f"manifest v{res['version']}" + (" (updated)" if res.get("updated") else " (already current)"), "green"))
+        return 0
+
+    if sub == "leave":
+        res = api("POST", "/api/team/leave", {})
+        if not res.get("ok"):
+            print(c(f"error: {res.get('error')}", "red")); return 1
+        print(c(f"left {res['left']}", "green"))
+        return 0
+
+    print(c(f"unknown subcommand: {sub}", "amber"))
+    print(cmd_team.__doc__)
+    return 1
+
+
 COMMANDS = {"build": cmd_build, "interpret": cmd_interpret, "daemon": cmd_daemon,
             "start-daemon": cmd_daemon, "health": cmd_health, "dashboard": cmd_dashboard,
             "doctor": cmd_doctor, "scheduler": cmd_scheduler, "demo": cmd_demo, "rotate-key": cmd_rotate_key,
@@ -6698,7 +6854,7 @@ COMMANDS = {"build": cmd_build, "interpret": cmd_interpret, "daemon": cmd_daemon
             "cost": cmd_cost, "version": cmd_version, "update": cmd_update,
             "mcp": cmd_mcp, "activate": cmd_activate, "market": cmd_market,
             "license": cmd_license, "connect": cmd_connect,
-            "trust": cmd_trust}
+            "trust": cmd_trust, "team": cmd_team}
 
 # Flag aliases — `railcall --version` / `-v` behave the same as `railcall version`. Convention
 # users expect from every other CLI; still routes through cmd_version so the drift logic is
