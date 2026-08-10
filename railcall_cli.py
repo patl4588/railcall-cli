@@ -2089,7 +2089,15 @@ def _verify_team_approval(receipt, explain=False):
         seen.add(pub)
         names.append(m.get("display_name") or pub[:12])
         ex("team: approval sig from %s → VALID" % (m.get("display_name") or pub[:12]))
-    quorum = int(block.get("quorum") or 1)
+    # A quorum below 1 must never verify — negative/zero (or a truthy non-int
+    # like "0") otherwise passes len(seen) < quorum with zero signatures.
+    # (Dave #09 / shweta #02; mirrors the station-side team_approval fix.)
+    try:
+        quorum = int(block.get("quorum") or 1)
+    except (TypeError, ValueError):
+        return fail("invalid quorum %r — must be an integer >= 1" % block.get("quorum"))
+    if quorum < 1:
+        return fail("invalid quorum %d — must be >= 1" % quorum)
     if len(seen) < quorum:
         return fail("only %d valid approval(s), quorum is %d" % (len(seen), quorum))
 
