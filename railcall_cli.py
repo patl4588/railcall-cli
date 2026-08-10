@@ -4390,8 +4390,20 @@ def _market_install(args):
             lines.append(c("publisher: ", "slate") + str(listing_meta["publisher_display_name"]))
         if listing_meta.get("publisher_pubkey"):
             lines.append(c("pubkey fp: ", "slate") + str(listing_meta["publisher_pubkey"])[:16] + "…")
+        # Browser/native modules ship a per-module Python venv that the tarball
+        # never carries (.moduleignore) — point the operator at the one command
+        # that builds it, instead of a mystery "module missing files" later.
+        try:
+            _mf = json.loads(spec["module_json"]) if isinstance(spec.get("module_json"), str) else (spec.get("module_json") or {})
+            _rt = _mf.get("runtime") if isinstance(_mf.get("runtime"), dict) else {}
+            _needs_venv = bool(_rt.get("venv") or _rt.get("pip") or _rt.get("post_install"))
+        except Exception:
+            _needs_venv = False
         lines.append("")
-        lines.append(c("Restart Studio to load the new commands:", "dim"))
+        if _needs_venv:
+            lines.append(c("This module needs a Python environment. Set it up:", "amber"))
+            lines.append(c("  railcall module setup " + safe, "cyan"))
+        lines.append(c("Then restart Studio to load the new commands:", "dim"))
         lines.append(c("  railcall studio", "cyan"))
         print(panel(lines, title="RAILCALL · market · install · module", color="purple"))
         # Anonymous install count — the marketplace deduplicates by
@@ -6811,6 +6823,79 @@ def cmd_set_credential(args=None):
     return 0
 
 
+def cmd_module(args=None):
+    """Module utilities.
+
+    usage:
+      railcall module setup <slug>   create the module's Python .venv + install
+                                     its declared deps (browser modules ship a
+                                     per-module venv; the tarball never carries
+                                     it — see .moduleignore)
+
+    Reads the module's runtime block in module.json:
+      "runtime": {"venv": true, "pip": ["playwright"],
+                  "post_install": ["playwright install chromium"]}
+    or a requirements.txt in the module dir. Running this IS your consent to
+    execute the module's declared setup on this machine."""
+    import subprocess as _sp
+    args = list(args or [])
+    if len(args) < 2 or args[0] != "setup":
+        print(panel([c("usage: railcall module setup <slug>", "slate"),
+                     c("example: railcall module setup sami666-singleops-browser", "dim")],
+                    title="RAILCALL · module", color="slate"))
+        return 1
+    slug = args[1]
+    mdir = os.path.expanduser("~/.railcall/station/modules/" + re.sub(r"[^A-Za-z0-9._-]", "-", slug))
+    if not os.path.isdir(mdir):
+        print(panel([c("Module not installed: " + slug, "amber"),
+                     c("Install it first:  railcall market install <listing-id>", "slate")],
+                    title="RAILCALL · module", color="amber")); return 1
+    try:
+        manifest = json.load(open(os.path.join(mdir, "module.json"), encoding="utf-8"))
+    except Exception as e:
+        print(panel([c("Can't read module.json: " + str(e)[:80], "red")],
+                    title="RAILCALL · module", color="red")); return 1
+    runtime = manifest.get("runtime") if isinstance(manifest.get("runtime"), dict) else {}
+    reqs = os.path.join(mdir, "requirements.txt")
+    pip_pkgs = [str(x) for x in (runtime.get("pip") or [])]
+    post = [str(x) for x in (runtime.get("post_install") or [])]
+    if not (runtime.get("venv") or os.path.isfile(reqs) or pip_pkgs):
+        print(panel([c(slug + " declares no Python venv needs — nothing to set up.", "cyan")],
+                    title="RAILCALL · module")); return 0
+    venv = os.path.join(mdir, ".venv")
+    steps = ["python -m venv .venv", "pip install --upgrade pip"]
+    if os.path.isfile(reqs): steps.append("pip install -r requirements.txt")
+    if pip_pkgs: steps.append("pip install " + " ".join(pip_pkgs))
+    steps += list(post)
+    print(panel([c("Setting up " + slug, "cyan"),
+                 c("dir:   ", "slate") + mdir,
+                 c("steps: ", "slate")] + [c("  · " + s, "dim") for s in steps],
+                title="RAILCALL · module · setup"))
+    def _run(cmd, **kw):
+        print(c("→ " + (cmd if isinstance(cmd, str) else " ".join(cmd)), "dim"))
+        return _sp.run(cmd, cwd=mdir, check=True, **kw)
+    try:
+        _run([sys.executable, "-m", "venv", venv])
+        pip = os.path.join(venv, "bin", "pip")
+        _run([pip, "install", "--upgrade", "pip"])
+        if os.path.isfile(reqs):
+            _run([pip, "install", "-r", reqs])
+        if pip_pkgs:
+            _run([pip, "install", *pip_pkgs])
+        for cmd in post:
+            env = dict(os.environ)
+            env["PATH"] = os.path.join(venv, "bin") + os.pathsep + env.get("PATH", "")
+            _run(cmd, shell=True, env=env)
+    except _sp.CalledProcessError as e:
+        print(panel([c("A setup step failed (exit %s)." % e.returncode, "red"),
+                     c("Fix the error above and re-run: railcall module setup " + slug, "slate")],
+                    title="RAILCALL · module · setup", color="red")); return 1
+    print(panel([c("✓ venv ready: " + os.path.join(venv, "bin", "python3"), "green"),
+                 c("Restart Studio (or run your workflow) to use " + slug + ".", "dim")],
+                title="RAILCALL · module · setup"))
+    print(footer(ok=True)); return 0
+
+
 def _open_browser(url):
     """Best-effort open in the default browser. Never blocks — if this fails
     the user can copy the URL manually from the prompt we always print."""
@@ -7238,7 +7323,8 @@ COMMANDS = {"build": cmd_build, "interpret": cmd_interpret, "daemon": cmd_daemon
             "doctor": cmd_doctor, "scheduler": cmd_scheduler, "demo": cmd_demo, "rotate-key": cmd_rotate_key,
             "balance": cmd_balance, "login": cmd_login, "studio": cmd_studio, "audit": cmd_audit,
             "verify": cmd_verify, "receipts": cmd_receipts, "backup": cmd_backup, "restore": cmd_restore,
-            "backup-verify": cmd_backup_verify, "set": cmd_set, "set-credential": cmd_set_credential, "workflow": cmd_workflow,
+            "backup-verify": cmd_backup_verify, "set": cmd_set, "set-credential": cmd_set_credential,
+            "module": cmd_module, "workflow": cmd_workflow,
             "cost": cmd_cost, "version": cmd_version, "update": cmd_update,
             "mcp": cmd_mcp, "activate": cmd_activate, "market": cmd_market,
             "license": cmd_license, "connect": cmd_connect,
