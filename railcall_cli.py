@@ -6687,6 +6687,130 @@ def _vault_write(provider, value):
         pass
 
 
+def _named_vault_path():
+    return os.path.expanduser("~/.railcall/station/.railcall_workspace/credentials.local.json")
+
+
+def _set_named_credential(provider, fields, label=None):
+    """Write a named credential into the SAME store module handlers read
+    (credentials.local.json -> vault_get(<provider>)). Mirrors the structure
+    Studio's Integrations Save produces, so the CLI and UI paths are
+    interchangeable. Reuses the provider's existing default cred_id if set,
+    else mints one and makes it default. Atomic, 0600."""
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    p = _named_vault_path()
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    try:
+        vault = json.load(open(p, encoding="utf-8")) if os.path.isfile(p) else {}
+        if not isinstance(vault, dict):
+            vault = {}
+    except Exception:
+        vault = {}
+    entry = vault.get(provider) if isinstance(vault.get(provider), dict) else {}
+    creds = entry.get("credentials") if isinstance(entry.get("credentials"), dict) else {}
+    cred_id = entry.get("default") if entry.get("default") in creds else None
+    if not cred_id:
+        safe = re.sub(r"[^a-z0-9]", "", str(provider).lower())[:16] or "cred"
+        cred_id = "cred_%s_%s" % (safe, os.urandom(2).hex())
+    prev = creds.get(cred_id) or {}
+    creds[cred_id] = {
+        "label":   label or prev.get("label") or (str(provider) + " (cli)"),
+        "fields":  dict(fields),
+        "created": prev.get("created") or now,
+        "updated": now,
+    }
+    vault[provider] = {"credentials": creds, "default": cred_id}
+    tmp = p + ".tmp"
+    fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(vault, fh, indent=2)
+    except BaseException:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
+    os.replace(tmp, p)
+    try: os.chmod(p, 0o600)
+    except OSError: pass
+    return cred_id
+
+
+def cmd_set_credential(args=None):
+    """Set a NAMED credential in the local vault — the terminal path to the
+    same store the Studio Integrations form writes, for module providers the
+    fixed `set` allowlist doesn't cover (Google Sheets, SingleOps, any module).
+
+    usage:
+      railcall set-credential <provider> --field k=v [--field k2=v2 ...]
+      railcall set-credential <provider> --json '{"k":"v", ...}'
+      railcall set-credential <provider> --json-file creds.json
+      railcall set-credential <provider> --label "My account" ...
+
+    Writes credentials.local.json — what module handlers read via
+    vault_get(<provider>). Values never leave this machine."""
+    args = list(args or [])
+    if not args or args[0].startswith("-"):
+        print(panel([c("usage: railcall set-credential <provider> [--field k=v | --json '{...}' | --json-file f]", "slate"),
+                     c("example: railcall set-credential singleops --field email=me@x.com --field password=secret", "dim"),
+                     c("example: railcall set-credential google-sheets --json-file gs.json", "dim")],
+                    title="RAILCALL · set-credential", color="slate"))
+        return 1
+    provider = args[0]
+    rest = args[1:]
+    label = None
+    fields = {}
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a == "--label" and i + 1 < len(rest):
+            label = rest[i + 1]; i += 2; continue
+        if a == "--json" and i + 1 < len(rest):
+            try:
+                d = json.loads(rest[i + 1]); assert isinstance(d, dict)
+                fields.update(d)
+            except Exception as e:
+                print(panel([c("--json must be a JSON object: " + str(e)[:80], "red")],
+                            title="RAILCALL · set-credential", color="red")); return 1
+            i += 2; continue
+        if a == "--json-file" and i + 1 < len(rest):
+            try:
+                d = json.load(open(os.path.expanduser(rest[i + 1]), encoding="utf-8")); assert isinstance(d, dict)
+                fields.update(d)
+            except Exception as e:
+                print(panel([c("could not read --json-file: " + str(e)[:80], "red")],
+                            title="RAILCALL · set-credential", color="red")); return 1
+            i += 2; continue
+        if a == "--field" and i + 1 < len(rest):
+            kv = rest[i + 1]
+            if "=" not in kv:
+                print(panel([c("--field expects key=value (got %r)" % kv, "red")],
+                            title="RAILCALL · set-credential", color="red")); return 1
+            k, v = kv.split("=", 1)
+            fields[str(k).strip()] = v
+            i += 2; continue
+        print(panel([c("unknown/incomplete flag: " + a, "red")],
+                    title="RAILCALL · set-credential", color="red")); return 1
+    if not fields:
+        print(panel([c("no fields — pass --field k=v, --json, or --json-file", "amber")],
+                    title="RAILCALL · set-credential", color="amber")); return 1
+    # Vault stores strings; coerce non-string field values.
+    fields = {k: (v if isinstance(v, str) else json.dumps(v) if isinstance(v, (dict, list)) else str(v))
+              for k, v in fields.items()}
+    cred_id = _set_named_credential(provider, fields, label)
+    print(panel([
+        c("Credential saved.", "green"),
+        c("provider:  ", "slate") + str(provider),
+        c("cred_id:   ", "slate") + cred_id + c("  (default)", "dim"),
+        c("fields:    ", "slate") + ", ".join(sorted(fields.keys())),
+        c("store:     ", "slate") + "credentials.local.json — module handlers read this",
+        "",
+        c("Run your workflow (or restart Studio) to use it. Values stay on this machine.", "dim"),
+    ], title="RAILCALL · set-credential"))
+    print(footer(ok=True))
+    return 0
+
+
 def _open_browser(url):
     """Best-effort open in the default browser. Never blocks — if this fails
     the user can copy the URL manually from the prompt we always print."""
@@ -7114,7 +7238,7 @@ COMMANDS = {"build": cmd_build, "interpret": cmd_interpret, "daemon": cmd_daemon
             "doctor": cmd_doctor, "scheduler": cmd_scheduler, "demo": cmd_demo, "rotate-key": cmd_rotate_key,
             "balance": cmd_balance, "login": cmd_login, "studio": cmd_studio, "audit": cmd_audit,
             "verify": cmd_verify, "receipts": cmd_receipts, "backup": cmd_backup, "restore": cmd_restore,
-            "backup-verify": cmd_backup_verify, "set": cmd_set, "workflow": cmd_workflow,
+            "backup-verify": cmd_backup_verify, "set": cmd_set, "set-credential": cmd_set_credential, "workflow": cmd_workflow,
             "cost": cmd_cost, "version": cmd_version, "update": cmd_update,
             "mcp": cmd_mcp, "activate": cmd_activate, "market": cmd_market,
             "license": cmd_license, "connect": cmd_connect,
