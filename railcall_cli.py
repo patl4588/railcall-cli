@@ -4187,7 +4187,7 @@ def _install_from_marketplace_backend(lid):
     return spec, meta
 
 
-def _install_write_module(lid, payload_bundle, listing_meta):
+def _install_write_module(lid, payload_bundle, listing_meta, force=False):
     """Install a MODULE listing to ~/.railcall/station/modules/<safe>/.
 
     v1 (single-file): writes the three canonical files (module.json +
@@ -4209,7 +4209,20 @@ def _install_write_module(lid, payload_bundle, listing_meta):
     station_root = os.path.expanduser("~/.railcall/station")
     module_dir = os.path.join(station_root, "modules", safe)
     if os.path.exists(module_dir):
-        return None, module_dir, "exists"
+        # A dir that exists but is missing its canonical files is a PARTIAL /
+        # corrupt install (an interrupted extraction) — the loader shows
+        # "missing files" and re-install used to refuse "already installed",
+        # forcing a hidden `rm -rf`. Auto-repair those, and honour --force for
+        # a deliberate refetch. Only a COMPLETE dir without --force is left
+        # alone (the honest "already installed").
+        _canon = [os.path.join(module_dir, "module.json"),
+                  os.path.join(module_dir, "handlers", "handler.py")]
+        complete = all(os.path.isfile(p) for p in _canon)
+        if force or not complete:
+            import shutil as _shutil
+            _shutil.rmtree(module_dir, ignore_errors=True)
+        else:
+            return None, module_dir, "exists"
 
     tarball_b64 = payload_bundle.get("module_files_b64")
     if tarball_b64:
@@ -4314,9 +4327,13 @@ def _market_install(args):
     receipt (tests/workflow_<safe>_receipt.json — /api/flow/run keys off this)
     and a Programs-index entry. Marks the receipt installed_from='marketplace'
     so Studio can badge the row and show creator attribution."""
+    args = list(args or [])
+    force = "--force" in args                     # deliberate refetch over an existing dir
+    args = [a for a in args if a != "--force"]
     if not args or args[0].startswith("--"):
-        print(panel([c("usage: railcall market install <id>", "slate"),
-                     c("example: railcall market install sami/notify-discord-on-event", "dim")],
+        print(panel([c("usage: railcall market install <id> [--force]", "slate"),
+                     c("example: railcall market install sami/notify-discord-on-event", "dim"),
+                     c("--force re-fetches even if the module dir already exists", "dim")],
                     title="RAILCALL · market", color="slate"))
         return 1
     lid = args[0]
@@ -4351,10 +4368,11 @@ def _market_install(args):
     # Module listings have a different payload shape + install target — write
     # to modules/<slug>/ instead of tests/. Loader picks up on next restart.
     if listing_meta.get("listing_type") == "module":
-        safe, module_dir, status = _install_write_module(lid, spec, listing_meta)
+        safe, module_dir, status = _install_write_module(lid, spec, listing_meta, force=force)
         if status == "exists":
-            print(panel([c(f"Already installed: {module_dir}", "amber"),
-                         c("Delete the directory to re-fetch, or use a different id.", "slate")],
+            print(panel([c(f"Already installed (complete): {module_dir}", "amber"),
+                         c("A partial/corrupt install would auto-repair on install; this one is intact.", "slate"),
+                         c("To re-fetch the latest anyway:  railcall market install " + lid + " --force", "cyan")],
                         title="RAILCALL · market · install · module", color="amber"))
             return 1
         try:
