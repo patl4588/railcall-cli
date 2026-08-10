@@ -2193,6 +2193,27 @@ def _verify_identity_credential(receipt, signing_pubkey_hex, explain=False):
     return lines
 
 
+def _merkle_v2(hashes):
+    """The station's v2 merkle, replicated byte-for-byte so an offline auditor
+    RE-DERIVES an agent receipt's roots without trusting the receipt or us
+    (workflow_engine._merkle). Domain-separated (0x00 leaf / 0x01 internal),
+    odd node promoted not duplicated, leaf count folded into the root (0x02)."""
+    if not hashes:
+        return None
+    nodes = [hashlib.sha256(b"\x00" + h.encode()).hexdigest() for h in hashes]
+    while len(nodes) > 1:
+        nxt = []
+        for i in range(0, len(nodes), 2):
+            if i + 1 < len(nodes):
+                nxt.append(hashlib.sha256(
+                    b"\x01" + nodes[i].encode() + nodes[i + 1].encode()).hexdigest())
+            else:
+                nxt.append(nodes[i])
+        nodes = nxt
+    return "sha256:" + hashlib.sha256(
+        b"\x02" + str(len(hashes)).encode() + b":" + nodes[0].encode()).hexdigest()
+
+
 def _verify_studio_receipt(receipt, path, user_key=None, explain=False):
     """Verify a Studio/workflow receipt: its 'signature' block signs the integrity field STRING
     (integrity_hash for builds, integrity for runs, integrity_root for workflow receipts), checked
@@ -2225,6 +2246,32 @@ def _verify_studio_receipt(receipt, path, user_key=None, explain=False):
                          c("  The body no longer matches its integrity_hash — edited after sealing.", "slate"),
                          c("  recomputed " + _recomputed[:32] + "…", "slate"),
                          c("  claimed    " + str(ih)[:32] + "…", "slate")],
+                        title="RAILCALL · verify", color="red"))
+            print(footer(ok=False)); return 1
+    # railcall_agent_receipt.v1: an agent node's receipt claims two merkle roots
+    # — one over its reasoning turns, one over its executed actions. Recompute
+    # the body hash AND re-derive both roots from the disclosed leaf hashes; a
+    # signature alone would pass a receipt whose leaves don't produce the root it
+    # claims. (Matches workflow_engine.verify_node_receipt; GAP 8 for agents.)
+    if str(receipt.get("schema", "")).startswith("railcall_agent_receipt") and ih:
+        _body = {k: v for k, v in receipt.items()
+                 if k not in ("signature", "integrity_hash", "ok") and not str(k).startswith("_")}
+        _recomputed = "sha256:" + hashlib.sha256(
+            json.dumps(_body, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        rl, al = receipt.get("reasoning_leaves"), receipt.get("action_leaves")
+        r_ok = isinstance(rl, list) and _merkle_v2(rl) == receipt.get("reasoning_root")
+        a_ok = isinstance(al, list) and _merkle_v2(al) == receipt.get("action_root")
+        s_ok = isinstance(rl, list) and len(rl) == receipt.get("steps")
+        ex("agent body recompute: %s vs claimed %s" % (_recomputed[:24] + "…", str(ih)[:24] + "…"))
+        ex("agent roots: reasoning=%s action=%s step_count=%s" % (r_ok, a_ok, s_ok))
+        if _recomputed != ih or not (r_ok and a_ok and s_ok):
+            why = ("body edited after sealing" if _recomputed != ih else
+                   "its disclosed leaves don't produce the roots it claims")
+            print(panel([c("✗ AGENT RECEIPT ALTERED", "red"),
+                         c("  " + why + ".", "slate"),
+                         c("  reasoning_root re-derives: %s" % r_ok, "slate"),
+                         c("  action_root re-derives:    %s" % a_ok, "slate"),
+                         c("  step count matches leaves:  %s" % s_ok, "slate")],
                         title="RAILCALL · verify", color="red"))
             print(footer(ok=False)); return 1
     key_id = sb.get("key_id"); alg = sb.get("alg", "ed25519")
