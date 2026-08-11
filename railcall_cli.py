@@ -3821,11 +3821,22 @@ def _market_list(args):
     show_all = "--all" in args
     if not show_all:
         params["featured"] = "1"     # default: intent-sized set, not the wall
-    for a in args:
-        if "=" in a and a.startswith("--"):
+    # Accept BOTH `--category=X` and `--category X` (space form). The old loop
+    # only matched the `=` form, so `railcall market list --category Revenue`
+    # silently dropped the filter (community #12, shweta).
+    _keys = ("category", "provider", "pattern", "trigger", "q", "limit", "offset")
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("--") and "=" in a:
             k, v = a[2:].split("=", 1)
-            if k in ("category", "provider", "pattern", "trigger", "q", "limit", "offset"):
+            if k in _keys:
                 params[k] = v
+        elif a.startswith("--") and a[2:] in _keys and i + 1 < len(args) \
+                and not args[i + 1].startswith("--"):
+            params[a[2:]] = args[i + 1]
+            i += 1
+        i += 1
     qs = "&".join(f"{k}={urllib.parse.quote(v)}" for k, v in params.items())
     code, j = _market_fetch(f"/v1/market/list?{qs}")
     if code != 200 or not j:
@@ -4266,9 +4277,9 @@ def _install_write_module(lid, payload_bundle, listing_meta, force=False):
         # catch a mismatch too, but this way a v2-install with a
         # marketplace-side manifest edit still lands on the wire copy).
         os.makedirs(os.path.join(module_dir, "handlers"), exist_ok=True)
-        with open(os.path.join(module_dir, "module.json"), "w", encoding="utf-8") as f:
+        with open(os.path.join(module_dir, "module.json"), "w", encoding="utf-8", newline="") as f:
             f.write(payload_bundle["module_json"])
-        with open(os.path.join(module_dir, "handlers", "handler.py"), "w", encoding="utf-8") as f:
+        with open(os.path.join(module_dir, "handlers", "handler.py"), "w", encoding="utf-8", newline="") as f:
             f.write(payload_bundle["handler_py"])
         with open(os.path.join(module_dir, "module.sig"), "w", encoding="utf-8") as f:
             f.write(payload_bundle["module_sig"].strip())
@@ -4276,9 +4287,9 @@ def _install_write_module(lid, payload_bundle, listing_meta, force=False):
 
     # v1 (single-file) legacy path — unchanged.
     os.makedirs(os.path.join(module_dir, "handlers"), exist_ok=True)
-    with open(os.path.join(module_dir, "module.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(module_dir, "module.json"), "w", encoding="utf-8", newline="") as f:
         f.write(payload_bundle["module_json"])
-    with open(os.path.join(module_dir, "handlers", "handler.py"), "w", encoding="utf-8") as f:
+    with open(os.path.join(module_dir, "handlers", "handler.py"), "w", encoding="utf-8", newline="") as f:
         f.write(payload_bundle["handler_py"])
     with open(os.path.join(module_dir, "module.sig"), "w", encoding="utf-8") as f:
         f.write(payload_bundle["module_sig"].strip())
@@ -5237,7 +5248,7 @@ def _market_module_sign(args):
     # pubkey fix + manifest_version promotion) land on disk before we
     # canonicalize + sign.
     try:
-        with open(os.path.join(module_dir, "module.json"), "w", encoding="utf-8") as f:
+        with open(os.path.join(module_dir, "module.json"), "w", encoding="utf-8", newline="") as f:
             # 2-space indent + trailing newline — matches how humans hand-edit
             # module.json; canonicalization for signing happens separately.
             json.dump(manifest, f, indent=2, ensure_ascii=False)
@@ -5903,11 +5914,17 @@ def _market_publish(args):
                     title="RAILCALL · publish", color="slate"))
         return 1
 
-    # Detect --type=module early — that path takes a DIRECTORY, not a JSON file.
+    # Detect --type module early — that path takes a DIRECTORY, not a JSON file.
+    # Accept BOTH `--type=module` and `--type module` (space form); the old
+    # peek only matched the `=` form, so `publish <dir> --type module` fell
+    # through to the JSON-spec path and failed (community #14, shweta).
     def _peek_flag(name, default=None):
-        for a in args[1:]:
+        rest = args[1:]
+        for i, a in enumerate(rest):
             if a.startswith("--" + name + "="):
                 return a[len(name) + 3:]
+            if a == "--" + name and i + 1 < len(rest) and not rest[i + 1].startswith("--"):
+                return rest[i + 1]
         return default
     if _peek_flag("type") == "module":
         return _market_publish_module(args)
@@ -6526,11 +6543,22 @@ def _cmd_trust_add(args):
     pubkey = args[0].lower().strip()
     name = ""
     note = ""
-    for a in args[1:]:
+    # Accept BOTH `--name=value` and `--name value` (space form). The old parse
+    # only matched the `=` form, so `trust add <pk> --name Foo --note Bar`
+    # silently dropped both flags (community #13, shweta).
+    rest = args[1:]
+    i = 0
+    while i < len(rest):
+        a = rest[i]
         if a.startswith("--name="):
             name = a[7:]
         elif a.startswith("--note="):
             note = a[7:]
+        elif a == "--name" and i + 1 < len(rest) and not rest[i + 1].startswith("--"):
+            name = rest[i + 1]; i += 1
+        elif a == "--note" and i + 1 < len(rest) and not rest[i + 1].startswith("--"):
+            note = rest[i + 1]; i += 1
+        i += 1
     T = _trust_module()
     res = T.add_publisher(_license_ws(), pubkey, publisher_name=name, note=note)
     if not res.get("ok"):
