@@ -4277,9 +4277,9 @@ def _install_write_module(lid, payload_bundle, listing_meta, force=False):
         # catch a mismatch too, but this way a v2-install with a
         # marketplace-side manifest edit still lands on the wire copy).
         os.makedirs(os.path.join(module_dir, "handlers"), exist_ok=True)
-        with open(os.path.join(module_dir, "module.json"), "w", encoding="utf-8") as f:
+        with open(os.path.join(module_dir, "module.json"), "w", encoding="utf-8", newline="") as f:
             f.write(payload_bundle["module_json"])
-        with open(os.path.join(module_dir, "handlers", "handler.py"), "w", encoding="utf-8") as f:
+        with open(os.path.join(module_dir, "handlers", "handler.py"), "w", encoding="utf-8", newline="") as f:
             f.write(payload_bundle["handler_py"])
         with open(os.path.join(module_dir, "module.sig"), "w", encoding="utf-8") as f:
             f.write(payload_bundle["module_sig"].strip())
@@ -4287,9 +4287,9 @@ def _install_write_module(lid, payload_bundle, listing_meta, force=False):
 
     # v1 (single-file) legacy path — unchanged.
     os.makedirs(os.path.join(module_dir, "handlers"), exist_ok=True)
-    with open(os.path.join(module_dir, "module.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(module_dir, "module.json"), "w", encoding="utf-8", newline="") as f:
         f.write(payload_bundle["module_json"])
-    with open(os.path.join(module_dir, "handlers", "handler.py"), "w", encoding="utf-8") as f:
+    with open(os.path.join(module_dir, "handlers", "handler.py"), "w", encoding="utf-8", newline="") as f:
         f.write(payload_bundle["handler_py"])
     with open(os.path.join(module_dir, "module.sig"), "w", encoding="utf-8") as f:
         f.write(payload_bundle["module_sig"].strip())
@@ -5248,7 +5248,7 @@ def _market_module_sign(args):
     # pubkey fix + manifest_version promotion) land on disk before we
     # canonicalize + sign.
     try:
-        with open(os.path.join(module_dir, "module.json"), "w", encoding="utf-8") as f:
+        with open(os.path.join(module_dir, "module.json"), "w", encoding="utf-8", newline="") as f:
             # 2-space indent + trailing newline — matches how humans hand-edit
             # module.json; canonicalization for signing happens separately.
             json.dump(manifest, f, indent=2, ensure_ascii=False)
