@@ -403,12 +403,89 @@ class CustomVaultDriver(VaultDriver):
         self._impl.append_audit_line(entry)
 
 
+_ALLOWED_VAULT_DRIVERS = {"local", "s3", "network_share", "custom", "railcall_hosted"}
+# env: refs in a SERVER-supplied config may only name a variable under this
+# prefix, so a malicious/compromised config can't read arbitrary env
+# (AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN, …) and ship it to the endpoint it also
+# chose. Operators put dedicated vault creds under RAILCALL_VAULT_* (overridable).
+_VAULT_ENV_REF_PREFIX = os.environ.get("RAILCALL_VAULT_ENV_PREFIX", "RAILCALL_VAULT_")
+
+
+def _validate_secret_ref_from_org_config(ref: str):
+    """A secret ref that arrives inside a server-supplied org vault config is
+    UNTRUSTED. It must not make the client read an arbitrary local file or
+    arbitrary env var and hand the bytes to a server-chosen endpoint. Returns
+    (ok, reason)."""
+    if not isinstance(ref, str) or not ref:
+        return True, None  # empty → the driver fails later; not a secret-egress path
+    if ref.startswith("file:"):
+        return False, "file: secret refs are not accepted from an org vault config (local-file exfil)"
+    if ref.startswith("env:"):
+        name = ref[4:]
+        if not name.startswith(_VAULT_ENV_REF_PREFIX):
+            return False, (f"env: refs from an org vault config may only name a "
+                           f"{_VAULT_ENV_REF_PREFIX}* variable, not {name!r}")
+        return True, None
+    if ref.startswith("keyring:"):
+        return True, None  # operator-local keyring, not server-readable
+    return False, f"unsupported secret ref scheme in org vault config: {ref.split(':', 1)[0]}:"
+
+
+def _validate_org_vault_config(config):
+    """Treat the org vault config as UNTRUSTED input (it is fetched from
+    /org/vault-config — settable by an org admin / a compromised server / a
+    MITM). Refuse any config that would ship a local secret to a
+    server-controlled host. Returns (ok, reason). (Security Finding 2.)"""
+    if not isinstance(config, dict):
+        return False, "config is not an object"
+    driver = config.get("driver")
+    if driver not in _ALLOWED_VAULT_DRIVERS:
+        return False, f"unknown driver {driver!r}"
+    if driver == "s3":
+        ep = config.get("endpoint_url")
+        if ep is not None:
+            if not isinstance(ep, str):
+                return False, "endpoint_url must be a string"
+            scheme = urllib.parse.urlparse(ep).scheme.lower()
+            if scheme != "https":
+                # http:// would leak the SigV4 Authorization header (which
+                # carries the access key) in plaintext to a chosen host.
+                return False, (f"endpoint_url must be https:// (got "
+                               f"{scheme or 'no-scheme'}) — refusing to send "
+                               "credentials to a non-TLS org endpoint")
+        for k in ("access_key_ref", "secret_key_ref"):
+            ok, why = _validate_secret_ref_from_org_config(config.get(k, ""))
+            if not ok:
+                return False, f"{k}: {why}"
+        return True, None
+    if driver == "custom":
+        # `custom` loads an ARBITRARY Python module (module_ref). A server must
+        # never be able to make the client import+run code without the operator
+        # opting in locally.
+        if os.environ.get("RAILCALL_ORG_VAULT_ALLOW_CUSTOM") != "1":
+            return False, ("custom driver from an org vault config requires "
+                           "RAILCALL_ORG_VAULT_ALLOW_CUSTOM=1 (arbitrary code load)")
+        return True, None
+    # local / network_share → local disk or a local mount; no secret egress to a
+    # server-chosen network host.
+    return True, None
+
+
 def load_driver(config: Optional[Dict[str, Any]]) -> VaultDriver:
     """Factory: dispatch on config['driver'] to a driver instance. Unknown
     or unsupported drivers return NullVaultDriver + log a warning so the
     caller keeps running — the local default writer still catches everything.
+
+    The config is UNTRUSTED (server-supplied via /org/vault-config): it is
+    validated first, and any config that would ship a local secret to a
+    server-chosen host is refused, falling back to local-only (Finding 2).
     """
     if not config or not isinstance(config, dict):
+        return NullVaultDriver()
+    _ok, _why = _validate_org_vault_config(config)
+    if not _ok:
+        print(f"[vault] refusing org vault config: {_why} — receipts stay local only",
+              file=sys.stderr)
         return NullVaultDriver()
     driver = config.get("driver")
     try:
