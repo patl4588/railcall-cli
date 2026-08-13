@@ -5930,6 +5930,19 @@ def _market_publish(args):
         return _market_publish_module(args)
 
     spec_path = args[0]
+    # Community bug #9b354c (akif): the "your first module" walkthrough says
+    # `railcall market publish .` with no --type flag, which fell through to
+    # this JSON-spec path and died on "Spec file not found: .". A directory
+    # containing module.json can't be anything BUT a module — route it there
+    # without demanding the flag the docs never mention.
+    if os.path.isdir(spec_path) and os.path.isfile(os.path.join(spec_path, "module.json")):
+        return _market_publish_module(args)
+    if os.path.isdir(spec_path):
+        print(panel([c(spec_path + " is a directory without a module.json.", "amber"),
+                     c("  modules:   railcall market publish <dir>   (needs module.json)", "cyan"),
+                     c("  workflows: railcall market publish <spec.json>", "cyan")],
+                    title="RAILCALL · publish", color="amber"))
+        return 1
     if not os.path.isfile(spec_path):
         print(panel([c("Spec file not found: " + spec_path, "amber")],
                     title="RAILCALL · publish", color="amber"))
