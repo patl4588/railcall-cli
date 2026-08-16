@@ -1155,6 +1155,26 @@ def cmd_doctor(_=None):
     # a machine that only uses the CLI is a supported configuration.
     _doctor_check_studio(rec)
 
+    # #311: a browser/venv module whose handler expects .venv/bin/python3 but
+    # has no venv is the exact post-update breakage Nick hit — the scrape dies
+    # with "No module named playwright" and the operator has no idea why.
+    # WARN (not FAIL): the station itself is healthy; that one module isn't.
+    _mods_dir = os.path.expanduser("~/.railcall/station/modules")
+    if os.path.isdir(_mods_dir):
+        for _m in sorted(os.listdir(_mods_dir)):
+            _h = os.path.join(_mods_dir, _m, "handlers", "handler.py")
+            if not os.path.isfile(_h):
+                continue
+            try:
+                _needs_venv = ".venv" in open(_h, encoding="utf-8", errors="ignore").read()
+            except OSError:
+                continue
+            _has_venv = os.path.isfile(os.path.join(_mods_dir, _m, ".venv", "bin", "python3"))
+            if _needs_venv and not _has_venv:
+                rec("WARN", "module %s expects a .venv sidecar but has none — its commands will fail" % _m,
+                    "cd ~/.railcall/station/modules/%s && python3 -m venv .venv && "
+                    ".venv/bin/pip install playwright && .venv/bin/python3 -m playwright install chromium" % _m)
+
     summary = {
         0: c("✓ environment is ready for local runs", "green"),
         1: c("⚠ usable, but some features are degraded — apply the → fixes above", "amber"),
@@ -4198,6 +4218,41 @@ def _install_from_marketplace_backend(lid):
     return spec, meta
 
 
+
+def _preserve_venv(module_dir):
+    """#311 (Nick, 2026-08-15): module updates silently destroyed the .venv
+    sidecar browser modules depend on (PEP 668 machines can't pip into the
+    station python, so Playwright lives in a per-module venv the OPERATOR
+    built). The venv is operator state — like credentials, it must survive
+    a reinstall the way credentials do. Returns a context manager that
+    stashes .venv aside before the caller wipes module_dir and restores it
+    after the new files land."""
+    import contextlib
+    import shutil as _sh
+    import tempfile as _tf
+
+    @contextlib.contextmanager
+    def _cm():
+        venv = os.path.join(module_dir, ".venv")
+        stash = None
+        if os.path.isdir(venv):
+            stash = _tf.mkdtemp(prefix="rc_venv_keep_")
+            _sh.move(venv, os.path.join(stash, ".venv"))
+        try:
+            yield
+        finally:
+            if stash:
+                try:
+                    dest = os.path.join(module_dir, ".venv")
+                    if not os.path.exists(dest):
+                        os.makedirs(module_dir, exist_ok=True)
+                        _sh.move(os.path.join(stash, ".venv"), dest)
+                        print(c("preserved module .venv across the update", "slate"))
+                finally:
+                    _sh.rmtree(stash, ignore_errors=True)
+    return _cm()
+
+
 def _install_write_module(lid, payload_bundle, listing_meta, force=False):
     """Install a MODULE listing to ~/.railcall/station/modules/<safe>/.
 
@@ -4231,7 +4286,8 @@ def _install_write_module(lid, payload_bundle, listing_meta, force=False):
         complete = all(os.path.isfile(p) for p in _canon)
         if force or not complete:
             import shutil as _shutil
-            _shutil.rmtree(module_dir, ignore_errors=True)
+            with _preserve_venv(module_dir):
+                _shutil.rmtree(module_dir, ignore_errors=True)
         else:
             return None, module_dir, "exists"
 
@@ -5350,8 +5406,21 @@ def _market_install_from_path(args):
     #    previous iteration would break the v2 tree signature).
     import shutil
     if os.path.isdir(dest):
-        shutil.rmtree(dest)
-    shutil.copytree(module_dir, dest)
+        with _preserve_venv(dest):
+            shutil.rmtree(dest)
+        # copytree needs the target absent; the preserver restored .venv into
+        # a recreated dest, so merge-copy instead of tree-copy when it exists
+        if os.path.isdir(dest):
+            for _root, _dirs, _files in os.walk(module_dir):
+                _rel = os.path.relpath(_root, module_dir)
+                _tgt = os.path.join(dest, _rel) if _rel != "." else dest
+                os.makedirs(_tgt, exist_ok=True)
+                for _f in _files:
+                    shutil.copy2(os.path.join(_root, _f), os.path.join(_tgt, _f))
+        else:
+            shutil.copytree(module_dir, dest)
+    else:
+        shutil.copytree(module_dir, dest)
     print(c(f"copied → {dest}", "slate"))
 
     # 3. Reload the running station + report this module's verdict.
