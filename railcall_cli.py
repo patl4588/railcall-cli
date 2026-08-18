@@ -4150,7 +4150,7 @@ def _install_write_receipt(lid, spec, source, listing_meta):
     return safe, receipt_path, "installed"
 
 
-def _install_from_marketplace_backend(lid):
+def _install_from_marketplace_backend(lid, redeem=None):
     """Fetch a creator-published listing from the marketplace backend
     (railcall-marketplace-lggm.onrender.com by default). Returns
     (spec, listing_meta) or (None, None) on failure — caller falls back.
@@ -4171,11 +4171,14 @@ def _install_from_marketplace_backend(lid):
         tok = _marketplace_token()
         if tok:
             headers["Authorization"] = "Bearer " + tok
+    # A `redeem` purchase id unlocks a PAID listing's payload for a bearer —
+    # so an unauthenticated machine holding a purchase can download the module
+    # bundle (the license seat cap is enforced separately at claim time).
+    url = _marketplace_backend_url() + "/listings/" + urllib.parse.quote(lid, safe="")
+    if redeem:
+        url += "?redeem=" + urllib.parse.quote(str(redeem), safe="")
     try:
-        req = urllib.request.Request(
-            _marketplace_backend_url() + "/listings/" + urllib.parse.quote(lid, safe=""),
-            method="GET",
-            headers=headers)
+        req = urllib.request.Request(url, method="GET", headers=headers)
         with urllib.request.urlopen(req, timeout=15) as r:
             payload = json.loads(r.read().decode("utf-8"))
     except Exception:
@@ -4186,10 +4189,12 @@ def _install_from_marketplace_backend(lid):
     # Explicit payload-gate signal from the server — tell the user what to
     # do instead of failing with "spec missing" which reads like a bug.
     if payload.get("payload_gated"):
-        print(panel([c(f"'{lid}' is a paid listing and this account doesn't own it yet.", "amber"),
-                     c("Buy or subscribe here, then run install again:", "slate"),
-                     c(f"  https://railcall.ai/marketplace/{payload.get('slug') or lid}", "cyan"),
-                     c("Or set RAILCALL_API_KEY to a key on the buying account.", "dim")],
+        print(panel([c(f"'{lid}' is a paid listing and you haven't unlocked it yet.", "amber"),
+                     c("If you already BOUGHT it, redeem with your purchase id (no login needed):", "slate"),
+                     c(f"  railcall market install {lid} --purchase <purchase_id>", "cyan"),
+                     c("The purchase id is on your dashboard: railcall.ai/marketplace/dashboard", "dim"),
+                     c("To buy it:", "slate"),
+                     c(f"  https://railcall.ai/marketplace/{payload.get('slug') or lid}", "cyan")],
                     title="RAILCALL · market · install", color="amber"))
         return None, None
 
@@ -4397,9 +4402,17 @@ def _market_install(args):
     args = list(args or [])
     force = "--force" in args                     # deliberate refetch over an existing dir
     args = [a for a in args if a != "--force"]
+    # --purchase <id>: redeem a bought paid listing without a marketplace login.
+    redeem = None
+    if "--purchase" in args:
+        _i = args.index("--purchase")
+        if _i + 1 < len(args):
+            redeem = args[_i + 1]
+            del args[_i:_i + 2]
     if not args or args[0].startswith("--"):
-        print(panel([c("usage: railcall market install <id> [--force]", "slate"),
+        print(panel([c("usage: railcall market install <id> [--purchase <purchase_id>] [--force]", "slate"),
                      c("example: railcall market install sami/notify-discord-on-event", "dim"),
+                     c("--purchase redeems a PAID listing you bought (no login needed)", "dim"),
                      c("--force re-fetches even if the module dir already exists", "dim")],
                     title="RAILCALL · market", color="slate"))
         return 1
@@ -4423,7 +4436,7 @@ def _market_install(args):
     else:
         # 2. Fall back to the marketplace backend (creator-published listings).
         source = "marketplace"
-        spec, meta = _install_from_marketplace_backend(lid)
+        spec, meta = _install_from_marketplace_backend(lid, redeem=redeem)
         if not spec:
             print(panel([c(f"'{lid}' not found in the curated gateway or the marketplace backend.", "amber"),
                          c("Check the id — creator listings look like '<slug>/<workflow-name>'.", "slate"),
@@ -6279,19 +6292,47 @@ def _market_auto_claim(args):
     return 0
 
 
+def _marketplace_optional_post(path, body):
+    """POST a marketplace endpoint with a bearer IF one is available, but do
+    NOT require auth. Used by BEARER flows (claim by purchase id) where the
+    purchase id itself is the credential, so an unauthenticated machine must
+    work. A bearer/API key is still sent when present (for audit), never
+    required. Returns (status_code, parsed_body_or_none)."""
+    headers = {"Content-Type": "application/json"}
+    api_key = (os.environ.get("RAILCALL_API_KEY") or "").strip()
+    bearer = api_key if api_key.startswith("rc_ak_") else (_marketplace_token() or "")
+    if bearer:
+        headers["Authorization"] = "Bearer " + bearer
+    req = urllib.request.Request(
+        _marketplace_backend_url() + path,
+        data=(json.dumps(body).encode("utf-8") if body is not None else None),
+        method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.getcode(), (json.loads(r.read().decode("utf-8")) if r.length != 0 else None)
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read().decode("utf-8"))
+        except Exception:
+            detail = {"detail": e.reason or "?"}
+        return e.code, detail
+    except Exception as e:
+        return 0, {"detail": str(e)[:200]}
+
+
 def _market_claim(args):
     """`railcall market claim <purchase_id>`
 
-    Post-purchase license claim. After buying a module on the marketplace,
-    the buyer runs this on the machine they want to install the module on.
-    Sends {install_pubkey: <this-machine>} to marketplace, which authorizes
-    (buyer owns the purchase + it's paid + listing is a module) and calls
-    the license service to mint a signed license bound to that pubkey. The
-    license JSON is then installed locally via the same install_license()
-    path `railcall license activate` uses — no shell hop required.
+    Post-purchase license claim. The purchase id is a BEARER redemption code:
+    anyone holding it can claim a license on this machine — NO marketplace
+    login required — up to a per-purchase seat cap (5 distinct machines). Sends
+    {install_pubkey: <this-machine>} to the marketplace, which validates the
+    purchase is paid + a module + under the seat cap, then mints a signed
+    license bound to that pubkey. The license JSON installs locally via the same
+    install_license() path `railcall license activate` uses.
 
-    Idempotent: re-claiming with the same install_pubkey re-mints (safe);
-    claiming with a different pubkey rebinds (supports moving to a new box).
+    Idempotent: re-claiming with the same install_pubkey re-mints and does NOT
+    consume another seat; a NEW machine beyond the cap is refused.
     """
     if len(args) < 1:
         print(panel([c("usage: railcall market claim <purchase_id>", "slate"),
@@ -6300,10 +6341,6 @@ def _market_claim(args):
                     title="RAILCALL · market · claim", color="slate"))
         return 1
     purchase_id = args[0]
-    if not _marketplace_token():
-        print(panel([c("Not logged in.", "amber"), c("  railcall market login", "cyan")],
-                    title="RAILCALL · market · claim", color="amber"))
-        return 1
     install_pk = _install_pubkey_hex()
     if not install_pk:
         print(panel([c("Cannot read this install's pubkey — is the station installed?", "amber")],
@@ -6316,8 +6353,11 @@ def _market_claim(args):
         c("install:  ", "slate") + install_pk[:24] + "…",
     ], title="RAILCALL · market · claim", color="purple"))
 
-    code, resp = _marketplace_authed_request(
-        "POST", f"/purchases/{purchase_id}/claim",
+    # Bearer redemption — no marketplace session required; the purchase id is
+    # the credential. A logged-in session / RAILCALL_API_KEY is still sent when
+    # present (audit), never required.
+    code, resp = _marketplace_optional_post(
+        f"/purchases/{purchase_id}/claim",
         {"install_pubkey": install_pk},
     )
     if code != 200 or not isinstance(resp, dict) or not resp.get("ok"):
