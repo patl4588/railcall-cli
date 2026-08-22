@@ -12,6 +12,7 @@ set -euo pipefail
 umask 022
 
 CYAN='\033[0;36m'; GREEN='\033[0;32m'; BLUE='\033[0;34m'; RED='\033[0;31m'; NC='\033[0m'
+YELLOW='\033[0;33m'
 
 echo -e "${CYAN}================================================================${NC}"
 echo -e "${CYAN}                 R A I L C A L L   I N S T A L L E R            ${NC}"
@@ -546,3 +547,51 @@ echo -e "${CYAN}================================================================
 echo -e "${GREEN}Then run:${NC}"
 echo -e "${CYAN}   railcall studio${NC}  — open the visual Studio in your browser (127.0.0.1:8799)"
 echo -e "${CYAN}   railcall${NC}         — the terminal dashboard (key, flows, commands)"
+
+# ── Stale Studio guard ───────────────────────────────────────────────────────
+# An install REPLACES the files a running Studio loaded at boot. Python does not
+# reload them, so the process keeps serving the OLD backend while the browser —
+# which fetches static assets fresh — loads the NEW frontend. New UI, old API,
+# same machine.
+#
+# 2026-08-22: a teammate hit exactly this after updating to v1.5.1. The new
+# Modules tab asked the old backend for per-command governance, got nothing, and
+# rendered "declared ?" with no controls. It looked like a missing feature, not
+# a stale process, and cost an afternoon of debugging a station that was fine.
+#
+# The remedy string already existed in railcall_cli.py — it just never fired at
+# the moment it was needed. We print, we do not kill: someone else's running
+# process is not ours to terminate without being asked.
+#
+# Every substitution below ends in `|| true`, and that is load-bearing: this
+# script runs under `set -euo pipefail`, where pgrep/grep finding NOTHING exits
+# 1 and takes the whole installer down with it. Without the guards, "no Studio
+# running" — the normal case on a fresh install — would abort the script at the
+# final step, after a successful install, with no message. Caught in a clean
+# container before shipping; on this laptop a Studio was always running, so the
+# failing path never executed.
+_studio_pids=""
+if command -v pgrep >/dev/null 2>&1; then
+    _studio_pids="$(pgrep -f 'studio_server\.py' 2>/dev/null | tr '\n' ' ' || true)"
+elif command -v ps >/dev/null 2>&1; then
+    # Git Bash / minimal images may lack pgrep. The [s] trick keeps grep itself
+    # out of its own results.
+    _studio_pids="$(ps aux 2>/dev/null | grep '[s]tudio_server\.py' | awk '{print $2}' | tr '\n' ' ' || true)"
+fi
+# No pgrep AND no ps: we cannot tell. Stay silent rather than warn on a guess.
+_studio_pids="$(printf '%s' "$_studio_pids" | sed 's/[[:space:]]*$//' || true)"
+
+if [ -n "$_studio_pids" ]; then
+    echo
+    echo -e "${YELLOW}================================================================${NC}"
+    echo -e "${YELLOW}  ⚠  A RailCall Studio is ALREADY RUNNING (pid: $_studio_pids)${NC}"
+    echo -e "${YELLOW}     It is now STALE — it loaded the previous version into memory${NC}"
+    echo -e "${YELLOW}     and will keep serving it until restarted. Your browser will${NC}"
+    echo -e "${YELLOW}     load the NEW interface against that OLD backend, which shows${NC}"
+    echo -e "${YELLOW}     up as missing or broken features rather than an error.${NC}"
+    echo
+    echo -e "${YELLOW}     Restart it before you use Studio:${NC}"
+    echo -e "${GREEN}         pkill -f studio_server.py && railcall studio${NC}"
+    echo -e "${YELLOW}     Then hard-refresh the browser (Cmd/Ctrl + Shift + R).${NC}"
+    echo -e "${YELLOW}================================================================${NC}"
+fi
