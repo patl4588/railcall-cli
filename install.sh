@@ -388,7 +388,25 @@ station_get() {
             return 0
         fi
         STATION_GOT="$a"
-        echo -e "${RED}  ✗ local station bundle sha mismatch — falling back to network${NC}"
+        # This is the AIR-GAP path only: a railcall_station.tar.gz sitting next
+        # to install.sh. The overwhelmingly common cause is a bundle left over
+        # from an EARLIER release — completely benign, because we ignore it and
+        # fetch the pinned copy instead.
+        #
+        # The old message was one red ✗ line saying "sha mismatch", which named
+        # no file, showed no shas, and did not say recovery was automatic. Users
+        # read it as "my install is broken/compromised" and reported it as a
+        # failure — on installs that then completed perfectly. A warning that
+        # cannot be told apart from a real failure trains people to ignore both.
+        echo -e "${YELLOW}  ! ignoring the local station bundle — it is not the one this${NC}"
+        echo -e "${YELLOW}    installer is pinned to, so it will NOT be used:${NC}"
+        echo -e "${YELLOW}      file:     $LOCAL_DIR/railcall_station.tar.gz${NC}"
+        echo -e "${YELLOW}      its sha:  $a${NC}"
+        echo -e "${YELLOW}      pinned:   $STATION_SHA${NC}"
+        echo -e "${BLUE}    Almost always this is a bundle from an older release. Downloading${NC}"
+        echo -e "${BLUE}    the pinned one now — nothing is wrong and no action is needed.${NC}"
+        echo -e "${BLUE}    (Doing a deliberate air-gap install? Replace that file with the${NC}"
+        echo -e "${BLUE}     bundle whose sha matches 'pinned' above.)${NC}"
     fi
     for u in "$STATION_URL" "$STATION_URL_MIRROR"; do
         # 2>/dev/null suppresses curl's own "404" chatter on the first
