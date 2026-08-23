@@ -40,6 +40,13 @@ def _fake_home(with_json=True, with_ext=True, extra_server=True):
             "manifest": {"name": "railcall", "display_name": "RailCall", "version": "0.1.0",
                          "server": {"mcp_config": {"command": "${HOME}/.railcall/bin/railcall",
                                                    "args": ["mcp"], "env": {"RAILCALL_WS": "${HOME}/ws"}}}}}
+    if with_ext:
+        # the installations record carries the RAW DXT template; Desktop resolves it
+        # into the installed manifest — which is what actually runs
+        inst["extensions"]["local.dxt.railcall.railcall"]["manifest"]["server"]["mcp_config"]["env"] = {
+            "RAILCALL_WS": "${user_config.workspace}", "KEEP": "${HOME}/x", "BAD": "${mystery.thing}"}
+        inst["extensions"]["local.dxt.railcall.railcall"]["manifest"]["user_config"] = {
+            "workspace": {"type": "directory", "default": "${HOME}/.railcall/workspace"}}
     json.dump(inst, open(os.path.join(appdir, "extensions-installations.json"), "w"))
     return home, os.path.join(appdir, "claude_desktop_config.json")
 
@@ -61,8 +68,26 @@ class Registrations(unittest.TestCase):
         self.assertEqual(kinds, ["ext", "json"])
         ext = next(r for r in regs if r["kind"] == "ext")
         self.assertEqual(ext["command"], os.path.join(home, ".railcall", "bin", "railcall"))   # ${HOME} expanded
-        self.assertEqual(ext["env"]["RAILCALL_WS"], os.path.join(home, "ws"))
+        # ${user_config.workspace} → the manifest's declared default (no installed manifest in this fixture)
+        self.assertEqual(ext["env"]["RAILCALL_WS"], os.path.join(home, ".railcall", "workspace"))
+        self.assertEqual(ext["env"]["KEEP"], os.path.join(home, "x"))
+        self.assertNotIn("BAD", ext["env"], "an unresolvable template must never be passed literally")
+        self.assertEqual(ext["unresolved_env"], ["BAD=${mystery.thing}"])
         self.assertNotIn("filesystem", [r["name"] for r in regs])
+
+    def test_installed_manifest_wins_over_installation_record(self):
+        home, _ = _fake_home()
+        ext_dir = os.path.join(home, "Library", "Application Support", "Claude",
+                               "Claude Extensions", "local.dxt.railcall.railcall")
+        json.dump({"name": "railcall", "display_name": "RailCall", "version": "0.1.0",
+                   "server": {"mcp_config": {"command": "${HOME}/.railcall/bin/railcall", "args": ["mcp"],
+                                             "env": {"RAILCALL_WS": "/resolved/by/desktop"}}}},
+                  open(os.path.join(ext_dir, "manifest.json"), "w"))
+        p1, p2 = _patched(home)
+        with p1, p2, mock.patch("os.path.expanduser", lambda p: p.replace("~", home)):
+            regs, _, _ = cli._mcp_desktop_registrations()
+        ext = next(r for r in regs if r["kind"] == "ext")
+        self.assertEqual(ext["env"]["RAILCALL_WS"], "/resolved/by/desktop")
 
     def test_invalid_json_is_reported_not_crashed(self):
         home, cfg = _fake_home()

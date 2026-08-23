@@ -1234,14 +1234,43 @@ def _mcp_desktop_registrations():
         blob = json.dumps(man).lower()
         if "railcall" not in blob:
             continue
+        ext_dir = os.path.join(ext_root, "Claude Extensions", eid)
+        # Prefer the INSTALLED manifest: Desktop writes it with ${user_config.*}
+        # already resolved (the installations record keeps the raw template). Probing
+        # with the template literal as RAILCALL_WS pointed the server at a workspace
+        # that does not exist — no policy, no token — and the doctor reported "full
+        # listing" for a station whose lazy flag was ON (2026-08-23).
+        try:
+            man_installed = json.load(open(os.path.join(ext_dir, "manifest.json"), encoding="utf-8"))
+            if isinstance(man_installed, dict) and man_installed:
+                man = man_installed
+        except Exception:
+            pass
         mc = ((man.get("server") or {}).get("mcp_config") or {})
         home = os.path.expanduser("~")
+        ucfg = man.get("user_config") or {}
+        import re as _re
         def _x(v):
-            return str(v).replace("${HOME}", home).replace("${__dirname}",
-                    os.path.join(ext_root, "Claude Extensions", eid)) if isinstance(v, str) else v
+            if not isinstance(v, str):
+                return v
+            v = v.replace("${HOME}", home).replace("${__dirname}", ext_dir)
+            # ${user_config.<key>} → the manifest's declared default (Desktop's
+            # own substitution is what the installed manifest already carries)
+            def _uc(m):
+                d = (ucfg.get(m.group(1)) or {}).get("default")
+                return str(d).replace("${HOME}", home) if d is not None else m.group(0)
+            return _re.sub(r"\$\{user_config\.([A-Za-z0-9_]+)\}", _uc, v)
+        env = {}
+        unresolved = []
+        for k, v in (mc.get("env") or {}).items():
+            xv = _x(v)
+            if isinstance(xv, str) and "${" in xv:
+                unresolved.append("%s=%s" % (k, xv))     # never pass a template literal
+                continue
+            env[k] = xv
         regs.append({"kind": "ext", "name": man.get("display_name") or man.get("name") or eid,
                      "command": _x(mc.get("command")), "args": [_x(a) for a in (mc.get("args") or [])],
-                     "env": {k: _x(v) for k, v in (mc.get("env") or {}).items()},
+                     "env": env, "unresolved_env": unresolved,
                      "source": "extension %s v%s (%s)" % (eid, man.get("version", "?"), inst),
                      "ext_id": eid})
     return regs, cfg_path, (isinstance(cfg, dict) and cfg.get("__invalid__") is True)
@@ -1455,6 +1484,10 @@ def cmd_doctor_mcp(_=None):
         rec("PASS", "'%s' [%s] answers tools/list in %ss · %d tools (%d module) · %s"
             % (r["name"], r["kind"], pr["seconds"], pr["tools"], pr["module_tools"],
                "lazy listing ON" if pr["lazy"] else "full listing"))
+        if r.get("unresolved_env"):
+            rec("WARN", "  extension env has unresolved template(s) the doctor could not expand: %s"
+                % ", ".join(r["unresolved_env"]),
+                "probe ran WITHOUT them — if Desktop behaves differently, this is why")
         if pr["illegal"]:
             rec("FAIL", "  %d tool name(s) are not MCP-legal (clients drop them silently): %s"
                 % (len(pr["illegal"]), ", ".join(pr["illegal"][:3])),
