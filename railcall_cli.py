@@ -638,6 +638,8 @@ def cmd_dashboard(_=None):
         c("daemon", "cyan") + "             start loopback daemon on 127.0.0.1:8555",
         c("health", "cyan") + "             daemon + socket-audit status",
         c("doctor", "cyan") + "             check the local environment (PASS/WARN/FAIL + the exact fix)",
+        c("doctor", "cyan") + c(" --mcp", "dim") + "       check the Claude Desktop ↔ MCP path end to end (launches the server as Desktop does)",
+        c("mcp", "cyan") + c(" dedupe", "dim") + "         leave exactly one RailCall server registered in Claude Desktop",
         c("scheduler", "cyan") + "          run scheduled workflows with Studio closed",
         c("balance", "cyan") + "            live run balance from the gateway",
         c("login", "cyan") + c(" <key>", "dim") + "        save your rc_live_ key, then verify",
@@ -1008,12 +1010,15 @@ def cmd_scheduler(args):
     return mod.main(argv)
 
 
-def cmd_doctor(_=None):
+def cmd_doctor(args=None):
     """Check the local environment for the exact classes of failure that break local runs — an old
     python, no `cryptography` (so receipts mint UNSIGNED), a PEP-668 pip refusal, an unreachable or
     empty Ollama, ~/.railcall/bin off PATH, a missing token — and report each honestly PASS/WARN/FAIL
     with the exact fix. Reaches the network for ONE 2s gateway ping only; offline is a fully-supported
     state for local build/audit/interpret, so it is reported as fine, never as a failure."""
+    args = args or []
+    if any(a in ("--mcp", "mcp") for a in args):
+        return cmd_doctor_mcp()
     lines = []
     worst = 0   # 0 = pass, 1 = warn, 2 = fail — drives the summary + exit code
 
@@ -1182,7 +1187,334 @@ def cmd_doctor(_=None):
     }[worst]
     lines.append("")
     lines.append(summary)
+    lines.append(c("Claude Desktop / MCP path not checked here — run: railcall doctor --mcp", "dim"))
     print(panel(lines, title="RAILCALL · doctor", color="purple"))
+    print(footer(ok=(worst < 2), label={0: "Ready", 1: "Degraded", 2: "Blocked"}[worst]))
+    return 0 if worst < 2 else 1
+
+
+# ---- railcall doctor --mcp: own the WHOLE path from "Sami types a sentence" to "the result comes back" ----
+#
+# 2026-08-23. Four failures in one week, every one at a seam between layers that each
+# reported green on its own side: an illegal tool name (server fine, client dropped it),
+# lazy listing on a client that never re-lists (server fine, client never looked), two
+# RailCall servers registered in Desktop (both fine, tools doubled), and Desktop hiding
+# local servers per chat (everything fine, toggle off). Sami: "why is it so complex?"
+# Because nobody owned the path end to end. This command does: it starts the installed
+# server EXACTLY the way each registered client entry does, reads what comes back, reads
+# the client's config and logs, and prints one line per problem WITH the fix.
+
+def _mcp_desktop_registrations():
+    """Every way Claude Desktop can launch a RailCall server on this machine.
+    Returns a list of {kind, name, command, args, env, source}. Two kinds:
+      json — an entry in claude_desktop_config.json (written by `railcall mcp config`)
+      ext  — an installed desktop extension (.dxt / .mcpb) whose manifest runs railcall"""
+    regs = []
+    cfg_path = _claude_desktop_config_path()
+    try:
+        cfg = json.load(open(cfg_path, encoding="utf-8")) if os.path.isfile(cfg_path) else {}
+    except Exception:
+        cfg = {"__invalid__": True}
+    for name, ent in ((cfg.get("mcpServers") or {}) if isinstance(cfg, dict) else {}).items():
+        if not isinstance(ent, dict):
+            continue
+        blob = json.dumps(ent).lower()
+        if "railcall" in blob or "mcp_server.py" in blob:
+            regs.append({"kind": "json", "name": name, "command": ent.get("command"),
+                         "args": list(ent.get("args") or []), "env": dict(ent.get("env") or {}),
+                         "source": cfg_path})
+    ext_root = os.path.dirname(cfg_path)
+    inst = os.path.join(ext_root, "extensions-installations.json")
+    try:
+        data = json.load(open(inst, encoding="utf-8")) if os.path.isfile(inst) else {}
+    except Exception:
+        data = {}
+    for eid, e in ((data.get("extensions") or {}) if isinstance(data, dict) else {}).items():
+        man = (e or {}).get("manifest") or {}
+        blob = json.dumps(man).lower()
+        if "railcall" not in blob:
+            continue
+        mc = ((man.get("server") or {}).get("mcp_config") or {})
+        home = os.path.expanduser("~")
+        def _x(v):
+            return str(v).replace("${HOME}", home).replace("${__dirname}",
+                    os.path.join(ext_root, "Claude Extensions", eid)) if isinstance(v, str) else v
+        regs.append({"kind": "ext", "name": man.get("display_name") or man.get("name") or eid,
+                     "command": _x(mc.get("command")), "args": [_x(a) for a in (mc.get("args") or [])],
+                     "env": {k: _x(v) for k, v in (mc.get("env") or {}).items()},
+                     "source": "extension %s v%s (%s)" % (eid, man.get("version", "?"), inst),
+                     "ext_id": eid})
+    return regs, cfg_path, (isinstance(cfg, dict) and cfg.get("__invalid__") is True)
+
+
+def _mcp_probe(reg, timeout=25):
+    """Launch a registration exactly as the client would, do initialize + tools/list,
+    and report what a client sees. Never raises."""
+    import subprocess
+    out = {"ok": False}
+    cmd = reg.get("command")
+    if not cmd:
+        out["error"] = "no command"
+        return out
+    if not (os.path.isfile(cmd) or shutil.which(cmd)):
+        out["error"] = "command not found: %s" % cmd
+        return out
+    env = dict(os.environ)
+    env.update({k: str(v) for k, v in (reg.get("env") or {}).items()})
+    t0 = time.time()
+    try:
+        p = subprocess.Popen([cmd] + list(reg.get("args") or []), stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True)
+    except Exception as e:
+        out["error"] = "failed to start: %s" % e
+        return out
+
+    def _send(o):
+        p.stdin.write(json.dumps(o) + "\n"); p.stdin.flush()
+
+    def _recv():
+        import select
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            r, _, _ = select.select([p.stdout], [], [], 0.5)
+            if r:
+                line = p.stdout.readline()
+                if not line:
+                    raise RuntimeError("server closed stdout")
+                try:
+                    m = json.loads(line)
+                except Exception:
+                    continue
+                if "id" in m:
+                    return m
+        raise RuntimeError("no reply within %ss" % timeout)
+
+    try:
+        _send({"jsonrpc": "2.0", "id": 0, "method": "initialize",
+               "params": {"protocolVersion": "2025-03-26", "capabilities": {},
+                          "clientInfo": {"name": "railcall-doctor", "version": "1"}}})
+        init = _recv()
+        instr = ((init.get("result") or {}).get("instructions") or "")
+        _send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        _send({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        tl = _recv()
+        tools = (tl.get("result") or {}).get("tools") or []
+        names = [t.get("name", "") for t in tools]
+        out.update({
+            "ok": True,
+            "seconds": round(time.time() - t0, 1),
+            "tools": len(names),
+            "module_tools": sum(1 for t in tools if "airlock-governed" in str(t.get("description", ""))),
+            "illegal": [n for n in names if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", n or "")],
+            "lazy": "LAZY LISTING" in instr,
+            "has_call_door": "railcall_call" in names,
+            "names": names,
+        })
+    except Exception as e:
+        # Terminate BEFORE reading stderr: a live child never closes it, and a
+        # blocking read here hung the doctor on a mute server (caught in tests).
+        err = ""
+        try:
+            p.terminate()
+            _, err = p.communicate(timeout=3)
+        except Exception:
+            try:
+                p.kill(); _, err = p.communicate(timeout=3)
+            except Exception:
+                err = ""
+        err = (err or "")[-400:].strip()
+        out["error"] = "%s%s" % (e, (" · stderr: " + err) if err else "")
+    finally:
+        try:
+            p.stdin.close()
+        except Exception:
+            pass
+        try:
+            p.terminate(); p.wait(timeout=3)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+    return out
+
+
+def _mcp_policy_snapshot():
+    """Read the MCP-facing policy flags from the INSTALLED station's enforcer (not a
+    copy of its logic), so what we print is what the server will do."""
+    wb = os.path.dirname(_mcp_server_path())
+    ws = os.path.expanduser("~/.railcall/station/.railcall_workspace")
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_rc_ep", os.path.join(wb, "execution_policy.py"))
+        ep = importlib.util.module_from_spec(spec); spec.loader.exec_module(ep)
+        snap = {"ws": ws}
+        for key, fn in (("lazy_tools_enabled", "mcp_lazy_tools_enabled"),
+                        ("module_reads_enabled", "mcp_module_reads_enabled")):
+            f = getattr(ep, fn, None)
+            snap[key] = bool(f(ws)) if f else None
+        try:
+            mcp = (ep._read(ws).get("mcp") or {})
+            snap["read_command_ids"] = list(mcp.get("read_command_ids") or [])
+        except Exception:
+            snap["read_command_ids"] = None
+        return snap
+    except Exception as e:
+        return {"error": str(e)[:120]}
+
+
+def _mcp_desktop_last_connect():
+    """From Claude Desktop's own MCP logs: when did it last start a RailCall server and
+    did it get a tools/list answer? Read-only; absent logs are not a failure."""
+    if sys.platform == "darwin":
+        logdir = os.path.expanduser("~/Library/Logs/Claude")
+    elif sys.platform == "win32":
+        logdir = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Claude", "logs")
+    else:
+        logdir = os.path.expanduser("~/.config/Claude/logs")
+    if not os.path.isdir(logdir):
+        return None
+    started = listed = None
+    for fn in os.listdir(logdir):
+        if not fn.startswith("mcp-server-") or "railcall" not in fn.lower():
+            continue
+        try:
+            lines = open(os.path.join(logdir, fn), encoding="utf-8", errors="ignore").read().splitlines()[-400:]
+        except OSError:
+            continue
+        for ln in lines:
+            ts = ln[:24] if ln[:4].isdigit() else None
+            if not ts:
+                continue
+            if "Server started and connected" in ln:
+                started = max(started or "", ts)
+            if 'method="tools/list"' in ln:
+                listed = max(listed or "", ts)
+    if not started and not listed:
+        return None
+    return {"started": started, "listed": listed}
+
+
+def cmd_doctor_mcp(_=None):
+    import textwrap
+    lines = []
+    worst = 0
+    body_w = max(40, _termwidth() - 4)
+
+    def rec(status, text, fix=None):
+        # Wrap instead of truncate: the → fix IS the deliverable of this command.
+        nonlocal worst
+        worst = max(worst, {"PASS": 0, "WARN": 1, "FAIL": 2}[status])
+        col = {"PASS": "green", "WARN": "amber", "FAIL": "red"}[status]
+        parts = textwrap.wrap(text, width=body_w - 6) or [""]
+        lines.append(c(status, col) + "  " + parts[0])
+        for extra in parts[1:]:
+            lines.append("      " + extra)
+        if fix:
+            fparts = textwrap.wrap(fix, width=body_w - 8) or [""]
+            lines.append(c("      → " + fparts[0], "dim"))
+            for extra in fparts[1:]:
+                lines.append(c("        " + extra, "dim"))
+
+    # 1. is there a server to run at all
+    server = _mcp_server_path()
+    if not os.path.isfile(server):
+        rec("FAIL", "no installed MCP server at %s" % server,
+            "curl -fsSL https://railcall.ai/install.sh | bash")
+    else:
+        try:
+            _tag = json.load(open(os.path.join(os.path.dirname(server), "STATION_VERSION.json"))).get("release_tag")
+        except Exception:
+            _tag = None
+        rec("PASS", "installed server %s · %s" % (server, _tag or "station tag unknown"))
+
+    # 2. how Claude Desktop is told to launch it
+    regs, cfg_path, invalid = _mcp_desktop_registrations()
+    if invalid:
+        rec("FAIL", "Claude Desktop config is not valid JSON: %s" % cfg_path,
+            "fix the JSON by hand (a backup may exist at %s.railcall-backup)" % cfg_path)
+    if not regs:
+        rec("WARN", "RailCall is not registered in Claude Desktop (no config entry, no extension)",
+            "railcall mcp config claude-desktop   (then restart Claude Desktop)")
+    elif len(regs) > 1:
+        rec("WARN", "%d RailCall servers registered in Claude Desktop — every tool appears twice: %s"
+            % (len(regs), ", ".join("%s[%s]" % (r["name"], r["kind"]) for r in regs)),
+            "railcall mcp dedupe --apply   (keeps the extension if installed, else the `railcall` entry; backs up the config)")
+    else:
+        rec("PASS", "one RailCall registration in Claude Desktop: %s [%s]" % (regs[0]["name"], regs[0]["kind"]))
+
+    # 3. launch each registration exactly as Desktop would, read what a client sees
+    probes = []
+    for r in regs:
+        pr = _mcp_probe(r)
+        probes.append((r, pr))
+        if not pr.get("ok"):
+            rec("FAIL", "'%s' [%s] does not answer: %s" % (r["name"], r["kind"], pr.get("error")),
+                "command: %s %s" % (r.get("command"), " ".join(r.get("args") or [])))
+            continue
+        rec("PASS", "'%s' [%s] answers tools/list in %ss · %d tools (%d module) · %s"
+            % (r["name"], r["kind"], pr["seconds"], pr["tools"], pr["module_tools"],
+               "lazy listing ON" if pr["lazy"] else "full listing"))
+        if pr["illegal"]:
+            rec("FAIL", "  %d tool name(s) are not MCP-legal (clients drop them silently): %s"
+                % (len(pr["illegal"]), ", ".join(pr["illegal"][:3])),
+                "update the station: curl -fsSL https://railcall.ai/install.sh | bash")
+        if pr["lazy"] and not pr["has_call_door"]:
+            rec("WARN", "  lazy listing is ON but this server has no railcall_call door — "
+                "Claude Desktop does not re-read the tool list after list_changed, so every "
+                "tool beyond the 12-tool core is UNREACHABLE from Desktop",
+                "Studio → Settings → Live Execution → turn OFF 'MCP lazy tool listing', then open a NEW Desktop chat "
+                "(or update the station: v1.5.4+ ships railcall_call, which makes lazy listing work everywhere)")
+        elif pr["lazy"]:
+            rec("PASS", "  lazy listing ON with the railcall_call door — hidden tools reachable on every client")
+
+    # 4. the policy knobs the server will enforce, read from the enforcer
+    snap = _mcp_policy_snapshot()
+    if "error" in snap:
+        rec("WARN", "could not read execution policy: %s" % snap["error"])
+    else:
+        if snap.get("module_reads_enabled"):
+            ids = snap.get("read_command_ids") or []
+            rec("PASS", "MCP module reads ON · %d command(s) allowed%s"
+                % (len(ids), (": " + ", ".join(ids[:4]) + (" …" if len(ids) > 4 else "")) if ids else ""),
+                None if ids else "allowlist is EMPTY — every module read still returns an airlock pointer; "
+                                 "add commands in Studio → Modules → governance row")
+        else:
+            rec("PASS", "MCP module reads OFF — module commands return an airlock pointer, never data "
+                "(Studio → Settings → Live Execution to change; writes ALWAYS need human approval regardless)")
+
+    # 5. the running Studio vs the files on disk (the stale-process class)
+    try:
+        ver = _doctor_fetch_json("/api/version")
+        if ver:
+            _doctor_check_studio_version(rec, ver)
+    except Exception:
+        pass
+
+    # 6. what Desktop itself logged
+    lc = _mcp_desktop_last_connect()
+    if lc:
+        if lc.get("listed"):
+            rec("PASS", "Claude Desktop last fetched the RailCall tool list at %s (UTC)" % lc["listed"])
+        elif lc.get("started"):
+            rec("WARN", "Claude Desktop started RailCall at %s but never asked for tools/list" % lc["started"],
+                "quit and reopen Claude Desktop")
+    elif regs:
+        rec("WARN", "no Claude Desktop MCP log for RailCall yet — Desktop has not launched it since install",
+            "quit and reopen Claude Desktop")
+
+    lines.append("")
+    for ln in textwrap.wrap("Desktop enables local servers PER CHAT: if RailCall tools are missing in a chat, "
+                            "open the tools menu in the message box and switch RailCall on — no restart needed.",
+                            width=body_w):
+        lines.append(c(ln, "slate"))
+    summary = {
+        0: c("✓ MCP path is healthy end to end", "green"),
+        1: c("⚠ MCP path works but is degraded — apply the → fixes above", "amber"),
+        2: c("✗ MCP path is broken — fix the FAIL line above", "red"),
+    }[worst]
+    lines.append(summary)
+    print(panel(lines, title="RAILCALL · doctor --mcp", color="purple"))
     print(footer(ok=(worst < 2), label={0: "Ready", 1: "Degraded", 2: "Blocked"}[worst]))
     return 0 if worst < 2 else 1
 
@@ -1502,9 +1834,12 @@ def cmd_mcp(args=None):
         except KeyboardInterrupt:
             return 0
 
+    if args[0] == "dedupe":
+        return cmd_mcp_dedupe(args[1:])
+
     if args[0] != "config":
         print(c("unknown: railcall mcp %s" % " ".join(args), "amber"))
-        print(c("try: railcall mcp config claude-desktop", "slate"))
+        print(c("try: railcall mcp config claude-desktop  ·  railcall mcp dedupe", "slate"))
         return 1
 
     target = args[1] if len(args) > 1 else "--stdio"
@@ -1554,6 +1889,73 @@ def cmd_mcp(args=None):
     print(c("unknown client: %s" % target, "amber"))
     print(c("supported: claude-desktop, cursor, windsurf, zed, --stdio", "slate"))
     return 1
+
+
+def cmd_mcp_dedupe(args=None):
+    """Leave exactly ONE RailCall server registered in Claude Desktop.
+
+    Two registrations (an entry from `railcall mcp config claude-desktop` AND the installed
+    desktop extension) make every tool appear twice and let the model pick either. Only
+    Desktop's own UI can remove an extension, so the rule is: if the extension is installed,
+    drop the JSON entries; otherwise keep the entry named `railcall` and drop the rest.
+    Dry-run by default; --apply writes (with a backup next to the config)."""
+    args = args or []
+    apply = "--apply" in args
+    regs, cfg_path, invalid = _mcp_desktop_registrations()
+    if invalid:
+        print(panel([c("Claude Desktop config is not valid JSON — not touching it: %s" % cfg_path, "amber")],
+                    title="RAILCALL · mcp dedupe", color="amber"))
+        return 1
+    if len(regs) <= 1:
+        print(panel([c("nothing to do — %d RailCall registration(s) in Claude Desktop" % len(regs), "green")]
+                    + [c("  %s [%s]" % (r["name"], r["kind"]), "dim") for r in regs],
+                    title="RAILCALL · mcp dedupe", color="purple"))
+        return 0
+    exts = [r for r in regs if r["kind"] == "ext"]
+    jsons = [r for r in regs if r["kind"] == "json"]
+    if exts:
+        keep = exts[0]
+        remove = jsons
+        why = "the installed extension '%s' stays (only Claude Desktop's UI can remove extensions)" % keep["name"]
+    else:
+        keep = next((r for r in jsons if r["name"] == "railcall"), jsons[0])
+        remove = [r for r in jsons if r is not keep]
+        why = "keeping the `%s` entry" % keep["name"]
+    import textwrap
+    _w = max(40, _termwidth() - 6)
+    lines = [c(ln, "cyan") for ln in textwrap.wrap("keep:   %s [%s] — %s" % (keep["name"], keep["kind"], why),
+                                                     width=_w, subsequent_indent="        ")]
+    for r in remove:
+        lines += [c(ln, "amber") for ln in textwrap.wrap("remove: %s [json] in %s" % (r["name"], cfg_path),
+                                                           width=_w, subsequent_indent="        ")]
+    if len(exts) > 1:
+        lines.append(c("note: %d RailCall extensions installed — remove extras in Claude Desktop → Settings → Extensions"
+                       % len(exts), "amber"))
+    if not remove:
+        lines.append(c("nothing this command can remove by itself", "dim"))
+        print(panel(lines, title="RAILCALL · mcp dedupe", color="purple"))
+        return 0
+    if not apply:
+        lines.append("")
+        lines.append(c("dry run — nothing written. Apply with:  railcall mcp dedupe --apply", "slate"))
+        print(panel(lines, title="RAILCALL · mcp dedupe", color="purple"))
+        return 0
+    cfg = json.load(open(cfg_path, encoding="utf-8"))
+    bak = cfg_path + ".railcall-backup"
+    shutil.copyfile(cfg_path, bak)
+    for r in remove:
+        cfg.get("mcpServers", {}).pop(r["name"], None)
+    tmp = cfg_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh, indent=2)
+    os.replace(tmp, cfg_path)
+    lines.append("")
+    lines += [c(ln, "dim") for ln in textwrap.wrap("written · backup: %s" % bak, width=_w, subsequent_indent="  ")]
+    lines += [c(ln, "slate") for ln in textwrap.wrap(
+        "Quit and reopen Claude Desktop, then enable RailCall in the chat's tools menu.", width=_w)]
+    print(panel(lines, title="RAILCALL · mcp dedupe", color="purple"))
+    print(footer(ok=True))
+    return 0
 
 
 # ---- railcall activate: turn a paid subscription into a working entitlement ----
