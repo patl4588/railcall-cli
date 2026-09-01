@@ -7938,7 +7938,40 @@ COMMANDS = {"build": cmd_build, "interpret": cmd_interpret, "daemon": cmd_daemon
 _VERSION_FLAGS = {"--version", "-v", "-V"}
 
 
+def _track_cli_command():
+    """BETA action telemetry (2026-09-01): append the top-level subcommand —
+    and ONLY the subcommand, never its arguments — to the station's local
+    event buffer. The Studio's hourly flusher ships the batch; if no station
+    is installed there is no buffer and this is a no-op. RAILCALL_NO_TELEMETRY
+    opts out. Fail-soft: telemetry must never break a command."""
+    try:
+        if os.environ.get("RAILCALL_NO_TELEMETRY"):
+            return
+        sub = (sys.argv[1] if len(sys.argv) > 1 else "dashboard").strip()[:48]
+        # second word for namespaced commands ("market login" not just "market")
+        if sub in ("market", "team", "mcp", "modules") and len(sys.argv) > 2:
+            sub = f"{sub} {sys.argv[2].strip()}"[:48]
+        ws = os.environ.get("RAILCALL_WS") or os.path.join(
+            os.path.expanduser("~"), ".railcall", "station", ".railcall_workspace")
+        if not os.path.isdir(ws):
+            return
+        buf = os.path.join(ws, "telemetry_events.jsonl")
+        try:
+            if os.path.getsize(buf) > 256 * 1024:
+                return
+        except OSError:
+            pass
+        with open(buf, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "kind": "cli.command", "detail": sub,
+                "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }) + "\n")
+    except Exception:
+        pass
+
+
 def main():
+    _track_cli_command()
     rc = _dispatch()
     # After the command's own output, never before — a notice must not interrupt a
     # result. Skipped for `version`/`update`, which already report drift themselves.
