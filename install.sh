@@ -602,6 +602,12 @@ echo -e "${CYAN}================================================================
 echo -e "${GREEN}Then run:${NC}"
 echo -e "${CYAN}   railcall studio${NC}  — open the visual Studio in your browser (127.0.0.1:8799)"
 echo -e "${CYAN}   railcall${NC}         — the terminal dashboard (key, flows, commands)"
+echo
+echo -e "${GREEN}Recommended — connect your free RailCall account:${NC}"
+echo -e "${CYAN}   railcall market login${NC}"
+echo -e "${BLUE}   Links this station to your account so marketplace purchases and module${NC}"
+echo -e "${BLUE}   licenses activate here automatically.${NC}"
+echo -e "${BLUE}   No account yet? Create one free at https://railcall.ai/marketplace/signup${NC}"
 
 # ── Stale Studio guard ───────────────────────────────────────────────────────
 # An install REPLACES the files a running Studio loaded at boot. Python does not

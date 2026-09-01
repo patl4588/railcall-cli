@@ -5238,10 +5238,27 @@ def _market_login(args):
         "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     })
     u = payload.get("user") or {}
-    print(panel([c("Logged in.", "cyan"),
-                 c("email:  ", "slate") + str(u.get("email", "?")),
-                 c("session at ", "dim") + _MARKETPLACE_SESSION_PATH + c("  (0600)", "dim")],
-                title="RAILCALL · market login", color="purple"))
+    # Auto-link this machine to the account (Sami, 2026-09-01: one command,
+    # not two — users shouldn't have to know link-install exists). Idempotent
+    # server-side; best-effort here: a link failure must never fail the login.
+    _linked_line = None
+    try:
+        _pk = _install_pubkey_hex()
+        if _pk:
+            _lc, _lr = _marketplace_authed_request(
+                "POST", "/account/link-install", {"install_pubkey": _pk})
+            if _lc == 200 and isinstance(_lr, dict) and _lr.get("ok"):
+                _linked_line = c("station: ", "slate") + "linked to this account (" + _pk[:16] + "…)"
+    except Exception:
+        pass
+    _lines = [c("Logged in.", "cyan"),
+              c("email:  ", "slate") + str(u.get("email", "?"))]
+    if _linked_line:
+        _lines.append(_linked_line)
+    else:
+        _lines.append(c("station: ", "slate") + c("not linked — run `railcall market link-install`", "dim"))
+    _lines.append(c("session at ", "dim") + _MARKETPLACE_SESSION_PATH + c("  (0600)", "dim"))
+    print(panel(_lines, title="RAILCALL · market login", color="purple"))
     return 0
 
 
