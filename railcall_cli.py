@@ -4642,7 +4642,25 @@ def _install_from_marketplace_backend(lid, redeem=None):
         if not isinstance(spec, dict) or not spec.get("steps"):
             return None, None
 
+    # Trust sidecars (module-resale P0 / d27e23 P2+P3). succession_doc rides on
+    # the listing read; the attestation is a public endpoint — best-effort GET,
+    # never blocks an install.
+    _att_doc = None
+    try:
+        _pk = str(payload.get("publisher_pubkey") or "")
+        if len(_pk) == 64:
+            _ar = urllib.request.Request(
+                _marketplace_backend_url() + "/licenses/publisher-attestation?pubkey=" + _pk,
+                method="GET")
+            with urllib.request.urlopen(_ar, timeout=4) as _r:
+                _aj = json.loads(_r.read().decode("utf-8"))
+            if _aj.get("ok") and _aj.get("attestation") and _aj.get("signature"):
+                _att_doc = {"attestation": _aj["attestation"], "signature": _aj["signature"]}
+    except Exception:
+        _att_doc = None
     meta = {
+        "succession_doc": payload.get("succession_doc") if isinstance(payload.get("succession_doc"), dict) else None,
+        "attestation_doc": _att_doc,
         "title": payload.get("title"),
         "publisher_pubkey": payload.get("publisher_pubkey"),
         "publisher_display_name": (payload.get("seller") or {}).get("display_name"),
@@ -4691,6 +4709,31 @@ def _preserve_venv(module_dir):
                 finally:
                     _sh.rmtree(stash, ignore_errors=True)
     return _cm()
+
+
+def _write_trust_sidecars(module_dir, listing_meta):
+    """Land the two OFFLINE-verifiable trust documents beside the module so the
+    station can check them at load without a network call:
+      publisher.succession.json  — a signed ownership transfer (old key -> new
+                                   key); the station rotates its pin on it
+                                   (publisher_trust.apply_succession, P3).
+      publisher.attestation.json — the marketplace attesting the publisher key
+                                   (P2). Until 2026-09-03 nothing ever WROTE this
+                                   file, so attested pins never happened — this
+                                   closes that gap.
+    Both OPTIONAL: absent -> nothing written. Neither is part of the publisher-
+    signed bundle (each carries its own signature). Never raises — a sidecar
+    failure must not fail an install."""
+    try:
+        meta = listing_meta or {}
+        for key, fname in (("succession_doc", "publisher.succession.json"),
+                           ("attestation_doc", "publisher.attestation.json")):
+            doc = meta.get(key)
+            if isinstance(doc, dict) and doc:
+                with open(os.path.join(module_dir, fname), "w", encoding="utf-8") as f:
+                    json.dump(doc, f, indent=2, sort_keys=True)
+    except Exception:
+        pass
 
 
 def _install_write_module(lid, payload_bundle, listing_meta, force=False):
@@ -4779,6 +4822,7 @@ def _install_write_module(lid, payload_bundle, listing_meta, force=False):
             f.write(payload_bundle["handler_py"])
         with open(os.path.join(module_dir, "module.sig"), "w", encoding="utf-8") as f:
             f.write(payload_bundle["module_sig"].strip())
+        _write_trust_sidecars(module_dir, listing_meta)
         return safe, module_dir, "installed"
 
     # v1 (single-file) legacy path — unchanged.
@@ -4789,6 +4833,7 @@ def _install_write_module(lid, payload_bundle, listing_meta, force=False):
         f.write(payload_bundle["handler_py"])
     with open(os.path.join(module_dir, "module.sig"), "w", encoding="utf-8") as f:
         f.write(payload_bundle["module_sig"].strip())
+    _write_trust_sidecars(module_dir, listing_meta)
     return safe, module_dir, "installed"
 
 
@@ -5552,6 +5597,9 @@ def _module_bundle_canonical(manifest_dict):
 # of files. Adding, removing, or modifying any file breaks the signature.
 
 _MODULE_DEFAULT_IGNORE = (
+    # Trust sidecars — NOT part of the signed tree. Must match the station's
+    # _MODULE_DEFAULT_IGNORE (studio_server.py) or every install fails verify.
+    "publisher.succession.json", "publisher.attestation.json",
     "__pycache__/", "*.pyc", "*.pyo", "*.pyd",
     ".pytest_cache/", ".mypy_cache/", ".ruff_cache/",
     ".git/", ".gitignore",
@@ -6623,6 +6671,161 @@ def _market_publisher(args):
     return 1
 
 
+def _market_transfer(args):
+    """`railcall market transfer <slug-or-id> --to <buyer_user_id> --price <cents>`
+
+    Module-resale P0: start an OWNERSHIP transfer of a listing you own. The
+    buyer pays through Stripe (you get the checkout link to send them); once
+    paid, YOU sign the succession (`railcall market sign-transfer <id>`) and
+    ownership + funds move. The buyer must already hold a registered publisher
+    key — the transfer succeeds TO that key."""
+    if not _marketplace_token():
+        print(panel([c("Not logged in.", "amber"), c("  railcall market login", "cyan")],
+                    title="RAILCALL · market · transfer", color="amber")); return 1
+    lid = args[0] if args and not args[0].startswith("--") else ""
+    to = price = None
+    for i, a in enumerate(args):
+        if a == "--to" and i + 1 < len(args): to = args[i + 1]
+        if a == "--price" and i + 1 < len(args): price = args[i + 1]
+    if not lid or not to or not price or not str(price).isdigit():
+        print(panel([c("usage: railcall market transfer <slug-or-id> --to <buyer_user_id> --price <cents>", "slate")],
+                    title="RAILCALL · market · transfer", color="slate")); return 1
+    code, resp = _marketplace_authed_request("POST", "/transfers",
+                                             {"listing_id": lid, "buyer_user_id": to, "price_cents": int(price)})
+    if code != 200 or not isinstance(resp, dict) or not resp.get("transferId"):
+        print(panel([c(f"Transfer not created (HTTP {code})", "amber"),
+                     c(str((resp or {}).get("message") or (resp or {}).get("error") or "?")[:300], "slate")],
+                    title="RAILCALL · market · transfer", color="amber")); return 1
+    print(panel([c("Transfer opened. Send the buyer this checkout link:", "cyan"),
+                 c(str(resp.get("checkoutUrl")), "cyan"), "",
+                 c("transfer id: ", "slate") + str(resp.get("transferId")),
+                 c("After they pay, sign the ownership succession with your publisher key:", "slate"),
+                 c("  railcall market sign-transfer " + str(resp.get("transferId")), "cyan")],
+                title="RAILCALL · market · transfer", color="purple"))
+    return 0
+
+
+def _market_sign_transfer(args):
+    """`railcall market sign-transfer <transfer_id>` — the SELLER's half of
+    releasing the asset: sign canonicalize(succession) with your publisher key.
+    The marketplace verifies it, co-signs with the root every station pins,
+    repoints ownership, and credits your wallet — atomically. You cannot sell
+    what you cannot sign for."""
+    if not args:
+        print(panel([c("usage: railcall market sign-transfer <transfer_id>", "slate")],
+                    title="RAILCALL · market · sign-transfer", color="slate")); return 1
+    if not _marketplace_token():
+        print(panel([c("Not logged in.", "amber"), c("  railcall market login", "cyan")],
+                    title="RAILCALL · market · sign-transfer", color="amber")); return 1
+    rec = _publisher_load()
+    if not rec or not rec.get("seed_hex"):
+        print(panel([c("No publisher keypair on this machine — this is not the selling publisher.", "amber"),
+                     c("  railcall market publisher init", "cyan")],
+                    title="RAILCALL · market · sign-transfer", color="amber")); return 1
+    tid = args[0]
+    code, t = _marketplace_authed_request("GET", "/transfers/" + urllib.parse.quote(tid, safe=""))
+    if code != 200 or not isinstance(t, dict) or not isinstance(t.get("succession"), dict):
+        print(panel([c(f"Could not load transfer (HTTP {code})", "amber"),
+                     c(str((t or {}).get("message") or "?")[:200], "slate")],
+                    title="RAILCALL · market · sign-transfer", color="amber")); return 1
+    if t.get("status") != "paid":
+        print(panel([c(f"Transfer is '{t.get('status')}' — the buyer must pay before you sign.", "amber")],
+                    title="RAILCALL · market · sign-transfer", color="amber")); return 1
+    succ = t["succession"]
+    if str(succ.get("old_pubkey", "")).lower() != str(rec["pubkey_hex"]).lower():
+        print(panel([c("This transfer succeeds FROM a different publisher key than yours.", "amber"),
+                     c("  transfer old key: " + str(succ.get("old_pubkey"))[:24] + "…", "slate"),
+                     c("  your key:         " + str(rec["pubkey_hex"])[:24] + "…", "slate")],
+                    title="RAILCALL · market · sign-transfer", color="amber")); return 1
+    # Same canonical bytes on all three sides (CLI / marketplace TS / station).
+    msg = _canonical_json_bytes(succ)
+    sig = _sign_raw(msg, bytes.fromhex(rec["seed_hex"]), None).hex()
+    print(panel([c("You are about to sign an OWNERSHIP SUCCESSION of your listing:", "amber"),
+                 c("  listing: ", "slate") + str(succ.get("publisher_id")),
+                 c("  to:      ", "slate") + str(succ.get("publisher_name")) + "  (" + str(succ.get("new_pubkey"))[:16] + "…)",
+                 c("  price:   ", "slate") + str(t.get("price_cents")) + " cents  → you net " + str(t.get("seller_net_cents")),
+                 c("Every station that installed this module will trust the new owner's key.", "dim")],
+                title="RAILCALL · market · sign-transfer", color="amber"))
+    try:
+        if input("Type the listing id to confirm: ").strip() != str(succ.get("publisher_id")):
+            print(c("Not signed.", "slate")); return 1
+    except (EOFError, KeyboardInterrupt):
+        print(); return 1
+    code, resp = _marketplace_authed_request("POST", "/transfers/" + urllib.parse.quote(tid, safe="") + "/sign",
+                                             {"seller_succession_sig": sig})
+    if code != 200 or not isinstance(resp, dict) or not resp.get("marketplace_sig"):
+        print(panel([c(f"Signature not accepted (HTTP {code})", "amber"),
+                     c(str((resp or {}).get("message") or "?")[:300], "slate")],
+                    title="RAILCALL · market · sign-transfer", color="amber")); return 1
+    print(panel([c("Transfer COMPLETED.", "cyan"),
+                 c("Ownership repointed, your wallet credited, succession co-signed by the marketplace.", "slate"),
+                 c("The buyer should now run:  railcall market accept-transfer " + tid, "dim")],
+                title="RAILCALL · market · sign-transfer", color="purple"))
+    return 0
+
+
+def _market_accept_transfer(args):
+    """`railcall market accept-transfer <transfer_id>` — the BUYER's half after
+    completion: download the module you now own, re-sign its tree with YOUR
+    publisher key, and republish (normal moderated publish). Installs then get
+    your bundle + the succession, and their stations rotate to your key."""
+    if not args:
+        print(panel([c("usage: railcall market accept-transfer <transfer_id>", "slate")],
+                    title="RAILCALL · market · accept-transfer", color="slate")); return 1
+    if not _marketplace_token():
+        print(panel([c("Not logged in.", "amber"), c("  railcall market login", "cyan")],
+                    title="RAILCALL · market · accept-transfer", color="amber")); return 1
+    rec = _publisher_load()
+    if not rec or not rec.get("seed_hex"):
+        print(panel([c("No publisher keypair on this machine.", "amber"), c("  railcall market publisher init", "cyan")],
+                    title="RAILCALL · market · accept-transfer", color="amber")); return 1
+    tid = args[0]
+    code, t = _marketplace_authed_request("GET", "/transfers/" + urllib.parse.quote(tid, safe=""))
+    if code != 200 or not isinstance(t, dict):
+        print(panel([c(f"Could not load transfer (HTTP {code})", "amber")],
+                    title="RAILCALL · market · accept-transfer", color="amber")); return 1
+    if t.get("status") != "completed":
+        print(panel([c(f"Transfer is '{t.get('status')}' — the seller must sign first.", "amber")],
+                    title="RAILCALL · market · accept-transfer", color="amber")); return 1
+    if str(t.get("new_pubkey", "")).lower() != str(rec["pubkey_hex"]).lower():
+        print(panel([c("This transfer succeeds TO a different publisher key than yours.", "amber")],
+                    title="RAILCALL · market · accept-transfer", color="amber")); return 1
+    lid = str(t.get("listing_id") or "")
+    spec, meta = _install_from_marketplace_backend(lid)
+    if not spec or not spec.get("module_files_b64"):
+        print(panel([c("Could not download the module bundle you now own.", "amber")],
+                    title="RAILCALL · market · accept-transfer", color="amber")); return 1
+    import tempfile as _tf, tarfile as _tar, io as _io, base64 as _b64, shutil as _sh
+    work = _tf.mkdtemp(prefix="rc-accept-")
+    try:
+        raw = _b64.b64decode(spec["module_files_b64"], validate=True)
+        with _tar.open(fileobj=_io.BytesIO(raw), mode="r:gz") as tf:
+            for m in tf.getmembers():
+                n = m.name.replace("\\", "/")
+                if n.startswith("/") or ".." in n.split("/"): continue
+                if not m.isreg(): continue
+                dest = os.path.join(work, n); os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with tf.extractfile(m) as src, open(dest, "wb") as out: out.write(src.read())
+        mpath = os.path.join(work, "module.json")
+        with open(mpath, encoding="utf-8") as f: manifest = json.load(f)
+        manifest["publisher_pubkey"] = rec["pubkey_hex"]
+        manifest.pop("signature", None)
+        with open(mpath, "w", encoding="utf-8") as f: json.dump(manifest, f, indent=2, sort_keys=True)
+        for side in ("publisher.succession.json", "publisher.attestation.json"):
+            try: os.remove(os.path.join(work, side))
+            except OSError: pass
+        # Sign the tree with YOUR key — same routine as `market module sign`.
+        rc = _market_module_sign([work])
+        if rc:
+            print(panel([c("Re-signing the module under your key failed.", "amber")],
+                        title="RAILCALL · market · accept-transfer", color="amber")); return 1
+        print(panel([c("Module re-signed under your publisher key. Publishing…", "cyan")],
+                    title="RAILCALL · market · accept-transfer", color="slate"))
+        return _market_publish_module([work, "--type=module"])
+    finally:
+        _sh.rmtree(work, ignore_errors=True)
+
+
 def _market_link_install(args):
     """`railcall market link-install`
 
@@ -6890,6 +7093,12 @@ def cmd_market(args=None):
         return _market_claim(rest)
     if sub == "link-install":
         return _market_link_install(rest)
+    if sub == "transfer":
+        return _market_transfer(rest)
+    if sub == "sign-transfer":
+        return _market_sign_transfer(rest)
+    if sub == "accept-transfer":
+        return _market_accept_transfer(rest)
     if sub == "auto-claim":
         return _market_auto_claim(rest)
     if sub in ("stats", "info"):
