@@ -7985,6 +7985,15 @@ def cmd_team(args=None):
       railcall team sync                          pull the latest manifest version
       railcall team leave                         drop the team from this station
 
+    Compute share — lend your LOCAL model (Ollama) to a teammate, pay in tokens:
+      railcall team share-model <member> [--tokens-per-day=N] [--expires=ISO]
+                                                  (holder) let <member> reason on MY Ollama
+      railcall team unshare <grant_id>            (holder) revoke it — takes effect on the next ask
+      railcall team reason "<prompt>" [--model=] [--max-tokens=] [--holder=<pubkey>] [--wait=180]
+                                                  (member) ask a teammate's model; prints the
+                                                  answer + its real cost (tokens, ms, tok/s)
+      railcall team compute                       totals: what I consumed / what I served
+
     Requires the station running (`railcall studio`) — the ceremony executes
     there; this command is a thin authenticated wrapper over /api/team/*.
     """
@@ -8122,6 +8131,141 @@ def cmd_team(args=None):
         if not res.get("ok"):
             print(c(f"error: {res.get('error')}", "red")); return 1
         print(c(f"left {res['left']}", "green"))
+        return 0
+
+    # ── compute share (2026-09-03) ────────────────────────────────────────
+    # Money never moves here: a `local_model` grant lends a teammate's Ollama,
+    # capped in TOKENS, and every answer comes back with its real cost.
+    def _flags(rest):
+        pos, kv = [], {}
+        for a in rest:
+            if a.startswith("--") and "=" in a:
+                k, v = a[2:].split("=", 1); kv[k] = v
+            else:
+                pos.append(a)
+        return pos, kv
+
+    def _iso_epoch(s):
+        try:
+            return time.mktime(time.strptime(str(s)[:19], "%Y-%m-%dT%H:%M:%S"))
+        except (ValueError, TypeError):
+            return None
+
+    if sub == "share-model":
+        pos, kv = _flags(args[1:])
+        if not pos:
+            print(c("usage: railcall team share-model <member name|pubkey prefix> [--tokens-per-day=N] [--expires=ISO]", "amber")); return 1
+        st = api("GET", "/api/team")
+        if not st.get("ok") or not st.get("in_team"):
+            print(c("not in a team — `railcall team show`", "red")); return 1
+        who = pos[0]
+        hits = [m for m in st["team"]["members"] if not m.get("is_self") and (
+            m["pubkey"].lower().startswith(who.lower()) or m["display_name"].casefold() == who.casefold())]
+        if len(hits) != 1:
+            print(c(f"{'ambiguous' if hits else 'unknown'} member {who!r} — teammates:", "amber"))
+            for m in st["team"]["members"]:
+                if not m.get("is_self"):
+                    print(f"  {m['display_name']:<20} {m['pubkey'][:16]}…")
+            return 1
+        body = {"credential_name": "local_model", "member_pubkey": hits[0]["pubkey"],
+                "verbs_allow": ["reason"]}
+        if kv.get("tokens-per-day"):
+            body["max_tokens_per_day"] = int(kv["tokens-per-day"])
+        if kv.get("expires"):
+            body["expires_at"] = kv["expires"]
+        res = api("POST", "/api/team/share/create", body)
+        if not res.get("ok"):
+            print(c(f"error: {res.get('error')}", "red")); return 1
+        g = res["grant"]
+        cap = g["caps"].get("max_tokens_per_day")
+        print(c(f"✓ {hits[0]['display_name']} can now reason on this station's local model", "green"))
+        print(c(f"  grant {g['grant_id']}  ·  cap {cap if cap is not None else 'none'} tokens/day"
+                f"  ·  revoke: railcall team unshare {g['grant_id']}", "slate"))
+        print(c("  keep `railcall studio` running — requests arrive over the team mesh and run on YOUR Ollama", "slate"))
+        return 0
+
+    if sub == "unshare":
+        if len(args) < 2:
+            print(c("usage: railcall team unshare <grant_id>", "amber")); return 1
+        res = api("POST", "/api/team/share/revoke", {"grant_id": args[1]})
+        if not res.get("ok"):
+            print(c(f"error: {res.get('error')}", "red")); return 1
+        print(c(f"revoked {res['revoked']}", "green"))
+        return 0
+
+    if sub == "reason":
+        pos, kv = _flags(args[1:])
+        prompt = " ".join(pos).strip()
+        if not prompt:
+            print(c('usage: railcall team reason "<prompt>" [--model=] [--max-tokens=] [--holder=<pubkey prefix>] [--wait=180]', "amber")); return 1
+        body = {"prompt": prompt}
+        if kv.get("model"):
+            body["model"] = kv["model"]
+        if kv.get("max-tokens"):
+            body["max_tokens"] = int(kv["max-tokens"])
+        if kv.get("holder"):
+            body["holder_pubkey"] = kv["holder"]
+        wait = float(kv.get("wait") or 180)
+        res = api("POST", "/api/team/reason", body)
+        if not res.get("ok"):
+            print(c(f"error: {res.get('error')}", "red")); return 1
+        use_id = res["use_id"]
+        print(c(f"asked {(res.get('holder_pubkey') or '?')[:16]}…  ({use_id}) — waiting for the answer over the mesh", "slate"))
+        deadline = time.time() + wait
+        u = None
+        while time.time() < deadline:
+            st = api("GET", f"/api/team/reason/status?use_id={use_id}")
+            u = st.get("use") if st.get("ok") else None
+            if u and u.get("status") != "sent":
+                break
+            time.sleep(3)
+        if not u or u.get("status") == "sent":
+            print(c(f"no answer within {int(wait)}s — the holder's station must be running (`railcall studio`) "
+                    f"and in the team; the answer still lands later (`railcall team compute`).", "amber"))
+            return 2
+        r = u.get("result") or {}
+        if u["status"] != "done":
+            print(c(f"{u['status']}: {r.get('denied') or r.get('error') or '?'}", "red")); return 1
+        print()
+        print((r.get("result") or {}).get("reply") or "")
+        print()
+        us = r.get("usage") or {}
+        rtt = None
+        s, e = _iso_epoch(u.get("sent_at")), _iso_epoch(r.get("at"))
+        if s is not None and e is not None and e >= s:
+            rtt = int(e - s)
+        cost = (f"{us.get('model') or '?'}  ·  {us.get('prompt_tokens')} in / {us.get('completion_tokens')} out tokens"
+                f"  ·  generation {us.get('eval_ms')} ms ({us.get('tokens_per_sec')} tok/s)"
+                f"  ·  load {us.get('load_ms')} ms"
+                + (f"  ·  round trip {rtt}s" if rtt is not None else ""))
+        print(c(cost, "cyan"))
+        if r.get("tokens_cap") is not None:
+            print(c(f"holder budget today: {r.get('tokens_today')} / {r.get('tokens_cap')} tokens", "slate"))
+        return 0
+
+    if sub == "compute":
+        res = api("GET", "/api/team/compute")
+        if not res.get("ok"):
+            print(c(f"error: {res.get('error')}", "red")); return 1
+        con = res.get("consumed") or {}
+        t = con.get("total") or {}
+        print(c("consumed (teammates' models working for me)", "cyan"))
+        print(f"  answers {t.get('answers', 0)}  ·  tokens {t.get('prompt_tokens', 0)} in / {t.get('completion_tokens', 0)} out"
+              f"  ·  generation {t.get('generation_ms', 0)} ms  ·  avg {t.get('avg_tokens_per_sec')} tok/s"
+              f"  ·  avg round trip {t.get('avg_round_trip_ms')} ms  ·  failed {con.get('failed', 0)}")
+        for pub, a in (con.get("by_holder") or {}).items():
+            print(f"    {pub[:16]}…  {a.get('answers')} answers  ·  {a.get('total_tokens')} tokens  ·  "
+                  f"{a.get('generation_ms')} ms  ·  {a.get('avg_tokens_per_sec')} tok/s  ·  {','.join(a.get('models') or [])}")
+        sv = res.get("served") or {}
+        print(c("served (my model working for teammates)", "cyan"))
+        print(f"  answers {sv.get('answers', 0)}  ·  tokens {sv.get('tokens', 0)}")
+        for pub, a in (sv.get("by_member") or {}).items():
+            print(f"    {pub[:16]}…  {a.get('answers')} answers  ·  {a.get('tokens')} tokens")
+        gs = res.get("grants_local_model") or []
+        if gs:
+            print(c("models shared with me", "cyan"))
+            for g in gs:
+                print(f"    {g['grant_id']}  holder {g['holder_pubkey'][:16]}…  cap {g['caps'].get('max_tokens_per_day', 'none')} tokens/day")
         return 0
 
     print(c(f"unknown subcommand: {sub}", "amber"))
