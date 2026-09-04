@@ -628,6 +628,7 @@ def cmd_dashboard(_=None):
     cmds = [
         c("demo", "cyan") + "               30-second golden path: build → signed receipt → offline verify",
         c("studio", "cyan") + "             open the visual Studio in your browser (127.0.0.1:8799)",
+        c("models", "cyan") + "             suggest local models this computer can run (+ pull them)",
         c("mcp", "cyan") + c(" config <client>", "dim") + "  connect Claude Desktop / Cursor / Windsurf / Zed",
         c("activate", "cyan") + "           fetch + install this machine's paid entitlement",
         c("build", "cyan") + c(" [csv]", "dim") + "        local compile + socket audit + receipt",
@@ -8298,7 +8299,72 @@ def cmd_team(args=None):
     return 1
 
 
-COMMANDS = {"build": cmd_build, "interpret": cmd_interpret, "daemon": cmd_daemon,
+def cmd_models(args=None):
+    """Local models for THIS machine.
+
+      railcall models suggest        what this computer can run + the best pick that
+                                     won't hurt it (probe: RAM/VRAM/chip/cores/disk)
+      railcall models pull <tag>     download a model with Ollama (streams progress)
+      railcall models list           what Ollama has pulled
+
+    `suggest` asks the running station (`railcall studio`); every speed it prints is
+    an ESTIMATE from memory bandwidth — measured speeds show on chat replies and in
+    `railcall team compute`.
+    """
+    args = args or []
+    sub = args[0] if args else "suggest"
+    if sub == "pull":
+        if len(args) < 2:
+            print(c("usage: railcall models pull <tag>   (e.g. qwen2.5:7b)", "amber")); return 1
+        import shutil as _sh
+        if not _sh.which("ollama"):
+            print(c("Ollama is not installed — https://ollama.com/download (or the chat app's one-click setup)", "amber")); return 1
+        return subprocess.call(["ollama", "pull", args[1]])
+    if sub == "list":
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=5) as r:
+                names = [m.get("name") for m in (json.loads(r.read().decode()).get("models") or [])]
+        except Exception:
+            print(c("Ollama is not running on 127.0.0.1:11434 (`ollama serve`)", "amber")); return 1
+        print("\n".join(names) if names else c("no models pulled yet — `railcall models suggest`", "slate")); return 0
+    if sub != "suggest":
+        print(c(f"unknown subcommand: {sub}", "amber")); print(cmd_models.__doc__); return 1
+
+    port = os.environ.get("STUDIO_PORT", "8799")
+    base = f"http://127.0.0.1:{port}"
+    try:
+        with open(os.path.join(_station_workspace, "cli_session_token")) as f:
+            tok = f.read().strip()
+    except OSError:
+        print(c("station not running — start it with: railcall studio  (the probe runs there)", "amber")); return 1
+    req = urllib.request.Request(base + "/api/models/recommend", data=b"{}", method="POST",
+                                 headers={"Content-Type": "application/json", "X-RailCall-Session": tok, "Origin": base})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            rec = json.loads(r.read().decode())
+    except Exception as e:
+        print(c(f"could not ask the station: {str(e)[:120]} (station older than v1.5.16?)", "red")); return 1
+    if not rec.get("ok"):
+        print(c(f"error: {rec.get('error')}", "red")); return 1
+    for ln in rec.get("summary") or []:
+        print(c(ln, "cyan") if ln.startswith(("best", "fastest", "biggest", "for code")) else ln)
+    print()
+    print(f"{'model':<22} {'download':>9} {'needs':>7} {'est tok/s':>10}  fit")
+    for m in rec.get("models") or []:
+        mark = "✓ installed" if m.get("installed") else ""
+        fit = {"comfortable": "comfortable", "fits": "fits (tight)", "too_big": "too big"}.get(m["fit"], m["fit"])
+        line = f"{m['tag']:<22} {m['size_gb']:>7.1f}GB {m['need_gb']:>6.1f}GB {str(m.get('est_tok_s') or '?'):>10}  {fit} {mark}"
+        if m.get("why") and m["fit"] != "too_big":
+            line += c(f"  — {m['why']}", "dim")
+        print(c(line, "dim") if m["fit"] == "too_big" else line)
+    picks = rec.get("picks") or {}
+    if picks.get("best"):
+        print(); print(c(f"install the recommended one:  railcall models pull {picks['best']}", "green"))
+    print(c(rec.get("note", ""), "slate"))
+    return 0
+
+
+COMMANDS = {"build": cmd_build, "models": cmd_models, "interpret": cmd_interpret, "daemon": cmd_daemon,
             "start-daemon": cmd_daemon, "health": cmd_health, "dashboard": cmd_dashboard,
             "doctor": cmd_doctor, "scheduler": cmd_scheduler, "demo": cmd_demo, "rotate-key": cmd_rotate_key,
             "balance": cmd_balance, "login": cmd_login, "studio": cmd_studio, "audit": cmd_audit,
