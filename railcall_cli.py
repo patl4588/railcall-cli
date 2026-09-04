@@ -7986,8 +7986,9 @@ def cmd_team(args=None):
       railcall team leave                         drop the team from this station
 
     Compute share — lend your LOCAL model (Ollama) to a teammate, pay in tokens:
-      railcall team share-model <member> [--tokens-per-day=N] [--expires=ISO]
-                                                  (holder) let <member> reason on MY Ollama
+      railcall team share-model <member> [--model=<ollama model>] [--tokens-per-day=N] [--expires=ISO]
+                                                  (holder) let <member> reason on MY Ollama;
+                                                  --model pins which of my models answers by default
       railcall team unshare <grant_id>            (holder) revoke it — takes effect on the next ask
       railcall team reason "<prompt>" [--model=] [--max-tokens=] [--holder=<pubkey>] [--wait=180]
                                                   (member) ask a teammate's model; prints the
@@ -8173,6 +8174,8 @@ def cmd_team(args=None):
             body["max_tokens_per_day"] = int(kv["tokens-per-day"])
         if kv.get("expires"):
             body["expires_at"] = kv["expires"]
+        if kv.get("model"):
+            body["default_model"] = kv["model"]
         res = api("POST", "/api/team/share/create", body)
         if not res.get("ok"):
             print(c(f"error: {res.get('error')}", "red")); return 1
@@ -8180,6 +8183,7 @@ def cmd_team(args=None):
         cap = g["caps"].get("max_tokens_per_day")
         print(c(f"✓ {hits[0]['display_name']} can now reason on this station's local model", "green"))
         print(c(f"  grant {g['grant_id']}  ·  cap {cap if cap is not None else 'none'} tokens/day"
+                f"  ·  default model {g['caps'].get('default_model') or 'first in `ollama list`'}"
                 f"  ·  revoke: railcall team unshare {g['grant_id']}", "slate"))
         print(c("  keep `railcall studio` running — requests arrive over the team mesh and run on YOUR Ollama", "slate"))
         return 0
@@ -8241,6 +8245,10 @@ def cmd_team(args=None):
         print(c(cost, "cyan"))
         if r.get("tokens_cap") is not None:
             print(c(f"holder budget today: {r.get('tokens_today')} / {r.get('tokens_cap')} tokens", "slate"))
+        have = (r.get("result") or {}).get("available_models") or []
+        if len(have) > 1:
+            print(c("holder also has: " + ", ".join(m for m in have if m != us.get("model"))
+                    + "   (--model=<name> to pick)", "slate"))
         return 0
 
     if sub == "compute":
