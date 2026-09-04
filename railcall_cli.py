@@ -8214,18 +8214,35 @@ def cmd_team(args=None):
         if not res.get("ok"):
             print(c(f"error: {res.get('error')}", "red")); return 1
         use_id = res["use_id"]
-        print(c(f"asked {(res.get('holder_pubkey') or '?')[:16]}…  ({use_id}) — waiting for the answer over the mesh", "slate"))
-        deadline = time.time() + wait
+        print(c(f"asked {(res.get('holder_pubkey') or '?')[:16]}…  ({use_id}) — waiting for the answer over the mesh", "slate"), flush=True)
+        t0 = time.time()
+        deadline = t0 + wait
         u = None
+        last_err = None
+        next_beat = t0 + 15
         while time.time() < deadline:
             st = api("GET", f"/api/team/reason/status?use_id={use_id}")
-            u = st.get("use") if st.get("ok") else None
+            if st.get("ok"):
+                u = st.get("use")
+                last_err = None
+            else:
+                # Say what went wrong, once per distinct error — a silent loop
+                # that ends in "no answer" hides the actual cause (2026-09-04:
+                # one ask was answered in 69 s yet the CLI reported a timeout).
+                err = str(st.get("error") or "?")[:160]
+                if err != last_err:
+                    print(c(f"  status check failed: {err} — retrying", "amber"), flush=True)
+                    last_err = err
             if u and u.get("status") != "sent":
                 break
+            if time.time() >= next_beat:
+                print(c(f"  … {int(time.time() - t0)}s, still waiting (their station polls the mesh every 15–60 s)", "dim"), flush=True)
+                next_beat += 15
             time.sleep(3)
         if not u or u.get("status") == "sent":
             print(c(f"no answer within {int(wait)}s — the holder's station must be running (`railcall studio`) "
-                    f"and in the team; the answer still lands later (`railcall team compute`).", "amber"))
+                    f"and in the team; the answer still lands later (`railcall team compute`)."
+                    + (f"  last status-check error: {last_err}" if last_err else ""), "amber"))
             return 2
         r = u.get("result") or {}
         if u["status"] != "done":
