@@ -8295,6 +8295,10 @@ def cmd_team(args=None):
         sv = res.get("served") or {}
         print(c("served (my model working for teammates)", "cyan"))
         print(f"  answers {sv.get('answers', 0)}  ·  tokens {sv.get('tokens', 0)}")
+        pp = res.get("presence_publish") or {}
+        if pp:
+            line = f"  last presence announcement {pp.get('at')}: {pp.get('sent', 0)}/{pp.get('grants', 0)} teammates told, model {'up' if pp.get('ollama_up') else 'DOWN'}"
+            print(c(line + (f"  — error: {pp['last_error']}" if pp.get("last_error") else ""), "red" if pp.get("last_error") else "slate"))
         for pub, a in (sv.get("by_member") or {}).items():
             print(f"    {pub[:16]}…  {a.get('answers')} answers  ·  {a.get('tokens')} tokens")
         gs = res.get("grants_local_model") or []
