@@ -8215,6 +8215,13 @@ def cmd_team(args=None):
         if not res.get("ok"):
             print(c(f"error: {res.get('error')}", "red")); return 1
         use_id = res["use_id"]
+        hp = res.get("holder_presence") or "unknown"
+        if hp != "online":
+            age = res.get("holder_age_s")
+            ago = (f"{age // 60} min ago" if isinstance(age, int) and age >= 60 else f"{age}s ago") if isinstance(age, int) else "never"
+            print(c({"offline": f"⚠ the holder's model looked OFFLINE (last seen {ago}) — the ask is queued; it answers when their station is back",
+                     "stale": f"◐ the holder's station was last seen {ago} — it may be asleep",
+                     "unknown": "? no presence heard from the holder yet (their station needs v1.5.16+)"}.get(hp, hp), "amber"), flush=True)
         print(c(f"asked {(res.get('holder_pubkey') or '?')[:16]}…  ({use_id}) — waiting for the answer over the mesh", "slate"), flush=True)
         t0 = time.time()
         deadline = t0 + wait
@@ -8291,7 +8298,13 @@ def cmd_team(args=None):
         if gs:
             print(c("models shared with me", "cyan"))
             for g in gs:
-                print(f"    {g['grant_id']}  holder {g['holder_pubkey'][:16]}…  cap {g['caps'].get('max_tokens_per_day', 'none')} tokens/day")
+                pres = g.get("presence") or "unknown"
+                age = g.get("age_s")
+                ago = (f"{age // 60}m ago" if isinstance(age, int) and age >= 60 else f"{age}s ago") if isinstance(age, int) else "never"
+                mark = {"online": c("● online", "green"), "stale": c(f"◐ stale — last seen {ago}", "amber"),
+                        "offline": c(f"○ OFFLINE — last seen {ago}", "red"), "unknown": c("? not heard from yet", "slate")}.get(pres, pres)
+                models = ", ".join(g.get("holder_models") or []) or (g["caps"].get("default_model") or "?")
+                print(f"    {g['grant_id']}  holder {g['holder_pubkey'][:16]}…  cap {g['caps'].get('max_tokens_per_day', 'none')} tokens/day  {mark}  [{models}]")
         return 0
 
     print(c(f"unknown subcommand: {sub}", "amber"))
