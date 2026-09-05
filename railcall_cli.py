@@ -7991,7 +7991,7 @@ def cmd_team(args=None):
                                                   (holder) let <member> reason on MY Ollama;
                                                   --model pins which of my models answers by default
       railcall team unshare <grant_id>            (holder) revoke it — takes effect on the next ask
-      railcall team reason "<prompt>" [--model=] [--max-tokens=] [--holder=<pubkey>] [--wait=180]
+      railcall team reason "<prompt>" [--model=] [--max-tokens=] [--holder=<pubkey>] [--wait=180] [--raw=1]
                                                   (member) ask a teammate's model; prints the
                                                   answer + its real cost (tokens, ms, tok/s)
       railcall team compute                       totals: what I consumed / what I served
@@ -8203,7 +8203,10 @@ def cmd_team(args=None):
         prompt = " ".join(pos).strip()
         if not prompt:
             print(c('usage: railcall team reason "<prompt>" [--model=] [--max-tokens=] [--holder=<pubkey prefix>] [--wait=180]', "amber")); return 1
-        body = {"prompt": prompt}
+        # The RailCall system prompt goes with the ask (the station prepends the
+        # canonical one) unless --raw: a context-free 70B otherwise invents what
+        # "RailCall" is.
+        body = {"prompt": prompt, "assistant": not kv.get("raw")}
         if kv.get("model"):
             body["model"] = kv["model"]
         if kv.get("max-tokens"):
