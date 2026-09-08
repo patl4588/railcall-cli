@@ -8384,7 +8384,92 @@ def cmd_models(args=None):
     return 0
 
 
-COMMANDS = {"build": cmd_build, "models": cmd_models, "interpret": cmd_interpret, "daemon": cmd_daemon,
+def cmd_assistant(args=None):
+    """railcall assistant usage [--days N] [--raw=1]
+    Operator analytics for the hosted RailCall Assistant (the super agent on
+    Pat's computer): jobs, how many ran on the host's local model only vs
+    reached a cloud model, per-model calls/tokens/time, estimated spend.
+    Reads the marketplace ADMIN session (~/.railcall/marketplace_admin_session.json),
+    refreshing it once when expired. Costs are the gateway's conservative
+    reservation-rate estimates; provider invoices are the truth."""
+    import json as _json
+    import urllib.request as _u
+    import urllib.error as _ue
+    args = list(args or [])
+    verb = args[0] if args and not args[0].startswith("--") else "usage"
+    days, raw = 1, False
+    for a in args[1:] if verb == args[:1][0:1] and args and not args[0].startswith("--") else args:
+        if a.startswith("--days"):
+            days = int(a.split("=", 1)[1]) if "=" in a else 7
+        elif a.startswith("--raw"):
+            raw = True
+    if verb != "usage":
+        print(panel([c("Usage: railcall assistant usage [--days N] [--raw=1]", "cyan")], title="RAILCALL · assistant", color="amber"))
+        return 1
+    sp = os.path.join(os.path.expanduser("~/.railcall"), "marketplace_admin_session.json")
+    try:
+        sess = _json.load(open(sp, "r", encoding="utf-8"))
+    except Exception:
+        print(panel([c("No marketplace ADMIN session on this machine.", "amber"),
+                     c("Sign in to the admin dashboard once (railcall.ai/marketplace/admin) on this machine.", "slate")],
+                    title="RAILCALL · assistant", color="amber"))
+        return 1
+    base = _marketplace_backend_url()
+
+    def _get(tok):
+        req = _u.Request(base + "/assistant/admin/usage?days=%d" % max(1, min(90, days)),
+                         headers={"Authorization": "Bearer " + tok})
+        with _u.urlopen(req, timeout=30) as r:
+            return _json.loads(r.read().decode("utf-8"))
+    try:
+        data = _get(sess.get("access_token", ""))
+    except _ue.HTTPError as e:
+        if e.code != 401 or not sess.get("refresh_token"):
+            print(panel([c("Gateway refused: HTTP %d" % e.code, "amber")], title="RAILCALL · assistant", color="amber"))
+            return 1
+        try:
+            rq = _u.Request(base + "/auth/refresh", data=_json.dumps({"refresh_token": sess["refresh_token"]}).encode("utf-8"),
+                            headers={"Content-Type": "application/json"}, method="POST")
+            with _u.urlopen(rq, timeout=20) as r:
+                fresh = _json.loads(r.read().decode("utf-8"))
+            sess.update({"access_token": fresh.get("access_token"), "refresh_token": fresh.get("refresh_token") or sess["refresh_token"]})
+            with open(sp, "w", encoding="utf-8") as f:
+                _json.dump(sess, f, indent=2)
+            data = _get(sess["access_token"])
+        except Exception as e2:
+            print(panel([c("Admin session expired and could not be refreshed: %s" % str(e2)[:120], "amber"),
+                         c("Sign in to the admin dashboard again on this machine.", "slate")], title="RAILCALL · assistant", color="amber"))
+            return 1
+    if raw:
+        print(_json.dumps(data, indent=2))
+        return 0
+    sm = data.get("summary") or {}
+    if not sm:
+        print(panel([c("The gateway answered without a summary (older build?) — try --raw=1", "amber")], title="RAILCALL · assistant", color="amber"))
+        return 1
+    usd = lambda micro: "$%.2f" % (float(micro or 0) / 1e6)
+    lines = [c("RailCall Assistant · last %d day(s) since %s" % (data.get("days", days), str(data.get("since", ""))[:10]), "cyan"),
+             c("  jobs %d  ·  completed %d  ·  failed %d  ·  canceled %d  ·  users %d" % (
+                 sm.get("jobs", 0), sm.get("completed", 0), sm.get("failed", 0), sm.get("canceled", 0), sm.get("users", 0)), "slate"),
+             c("  local-only %d  ·  reached a cloud model %d  ·  est. spend %s  ·  avg round trip %s" % (
+                 sm.get("local_only_jobs", 0), sm.get("cloud_jobs", 0), usd(sm.get("charged_micro")),
+                 ("%.1fs" % (sm["avg_latency_ms"] / 1000.0)) if sm.get("avg_latency_ms") else "n/a"), "slate"),
+             c("  per model (calls · in/out tokens · model time):", "dim")]
+    for key, m in sorted((data.get("by_model") or {}).items(), key=lambda kv: -kv[1].get("calls", 0)):
+        lines.append(c("    %-40s %4d · %6d/%-6d · %6.1fs" % (key[:40], m.get("calls", 0), m.get("input_tokens", 0),
+                                                           m.get("output_tokens", 0), m.get("elapsed_ms", 0) / 1000.0), "slate"))
+    pd = data.get("per_day") or {}
+    if len(pd) > 1:
+        lines.append(c("  per day (jobs · local-only · cloud · est. spend):", "dim"))
+        for d in sorted(pd):
+            x = pd[d]
+            lines.append(c("    %s  %3d · %3d · %3d · %s" % (d, x.get("jobs", 0), x.get("local_only", 0), x.get("cloud", 0), usd(x.get("charged_micro"))), "slate"))
+    lines.append(c("  " + str(data.get("note", "")), "dim"))
+    print(panel(lines, title="RAILCALL · assistant", color="purple"))
+    return 0
+
+
+COMMANDS = {"build": cmd_build, "assistant": cmd_assistant, "models": cmd_models, "interpret": cmd_interpret, "daemon": cmd_daemon,
             "start-daemon": cmd_daemon, "health": cmd_health, "dashboard": cmd_dashboard,
             "doctor": cmd_doctor, "scheduler": cmd_scheduler, "demo": cmd_demo, "rotate-key": cmd_rotate_key,
             "balance": cmd_balance, "login": cmd_login, "studio": cmd_studio, "audit": cmd_audit,
