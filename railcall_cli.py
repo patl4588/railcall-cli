@@ -5276,6 +5276,20 @@ def _market_login(args):
                      c("(Check the RAILCALL_MARKETPLACE_URL env var if you're targeting a non-prod backend.)", "dim")],
                     title="RAILCALL · market login", color="amber"))
         return 1
+    if "--admin" in (args or []):
+        # `railcall market login --admin`: same password login, typed by the
+        # operator, stored as the ADMIN session (0600) that operator-only
+        # reads such as `railcall assistant usage` use. Never linked to the
+        # station identity — it is not the customer account.
+        ap = os.path.join(os.path.expanduser("~/.railcall"), "marketplace_admin_session.json")
+        fd = os.open(ap + ".tmp", os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"access_token": payload.get("access_token"), "refresh_token": payload.get("refresh_token"),
+                       "user": payload.get("user"), "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, f, indent=2)
+        os.replace(ap + ".tmp", ap)
+        print(panel([c("Admin session saved.", "cyan"), c("  " + ap, "dim"),
+                     c("Now: railcall assistant usage --days=7", "slate")], title="RAILCALL · market", color="purple"))
+        return 0
     _marketplace_session_save({
         "access_token": payload.get("access_token"),
         "refresh_token": payload.get("refresh_token"),
