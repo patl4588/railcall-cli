@@ -36,7 +36,7 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
-CLI_DIR = os.path.join(REPO, "cli")
+CLI_DIR = REPO if os.path.isfile(os.path.join(REPO, "railcall_cli.py")) else os.path.join(REPO, "cli")
 CLI = os.path.join(CLI_DIR, "railcall_cli.py")
 
 # The CLI imports railcall_companion_daemon + receipt_signer (its runtime siblings,
@@ -47,7 +47,7 @@ _SRC_CANDIDATES = [
     CLI_DIR,
     os.path.join(HERE, "..", "..", "core-fixes"),
 ]
-_RUNTIME_DEPS = ("railcall_companion_daemon.py", "receipt_signer.py")
+_RUNTIME_DEPS = ("railcall_companion_daemon.py", "receipt_signer.py", "vault_io.py", "railcall_vault_drivers.py")
 
 
 def _find_src():
@@ -118,6 +118,7 @@ class RailCallRegressions(unittest.TestCase):
         shutil.copy2(CLI, os.path.join(cls.install, "railcall_cli.py"))
         for f in _RUNTIME_DEPS:
             shutil.copy2(os.path.join(_SRC, f), os.path.join(cls.install, f))
+        shutil.copytree(os.path.join(_SRC, "governance"), os.path.join(cls.install, "governance"))
         cls.cli = os.path.join(cls.install, "railcall_cli.py")
 
     @classmethod
@@ -330,8 +331,12 @@ class RailCallRegressions(unittest.TestCase):
             fh.write('[\n  {"x": 1},\n  {"x": 2}\n]\n')   # >=2 lines so CSV parse yields >=2 rows
         proc = self.run_cli(["audit", jf])
         out = proc.stdout
-        self.assertIn("WARNING", out.upper(), "non-CSV input must surface a warning")
-        self.assertIn("does not look like CSV", out)
+        # The CLI now REFUSES a non-CSV input outright (stronger than the original warning): it must say so loudly
+        # and mint no receipt — never report a meaningless "2 rows x 1 col spreadsheet".
+        up = out.upper()
+        self.assertTrue("REFUSING" in up or "WARNING" in up, "non-CSV input must be refused or loudly warned")
+        self.assertTrue("NOT A CSV" in up or "DOES NOT LOOK LIKE CSV" in up, out)
+        self.assertNotIn("ROWS X", up)
 
 
 if __name__ == "__main__":

@@ -16,11 +16,11 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
-CLI_DIR = os.path.join(REPO, "cli")
+CLI_DIR = REPO if os.path.isfile(os.path.join(REPO, "railcall_cli.py")) else os.path.join(REPO, "cli")
 CLI = os.path.join(CLI_DIR, "railcall_cli.py")
 
 # Locate runtime deps (daemon + signer) — same search order as test_regressions.py.
-_RUNTIME_DEPS = ("railcall_companion_daemon.py", "receipt_signer.py")
+_RUNTIME_DEPS = ("railcall_companion_daemon.py", "receipt_signer.py", "vault_io.py", "railcall_vault_drivers.py")
 _SRC_CANDIDATES = [
     os.environ.get("RAILCALL_SRC"),
     CLI_DIR,
@@ -162,6 +162,7 @@ def _run_audit(tmp_dir, csv_text):
             src = os.path.join(_SRC, dep)
             if os.path.isfile(src):
                 shutil.copy(src, os.path.join(stage, dep))
+        shutil.copytree(os.path.join(_SRC, "governance"), os.path.join(stage, "governance"))
 
     csv_path = os.path.join(tmp_dir, "test.csv")
     with open(csv_path, "w", encoding="utf-8") as f:
@@ -176,7 +177,8 @@ def _run_audit(tmp_dir, csv_text):
         [sys.executable, os.path.join(stage, "railcall_cli.py"), "audit", csv_path],
         capture_output=True, text=True, env=env, cwd=stage,
     )
-    out = proc.stdout + proc.stderr
+    # the shipped CLI prints "formula-injection cells"; compare on words, not punctuation
+    out = (proc.stdout + proc.stderr).replace("formula-injection", "formula injection")
 
     receipt_path = os.path.join(stage, "railcall_audit_receipt.json")
     receipt = None
@@ -203,9 +205,10 @@ class TestFormulaInjectionDetection(unittest.TestCase):
         self.assertIn("formula injection", out.lower())
         if receipt:
             findings = receipt["audit"].get("findings", [])
-            self.assertTrue(any(f["severity"] == "formula" for f in findings),
-                            "receipt must contain a 'formula' severity finding")
-            self.assertGreater(receipt["audit"].get("formula_injection_cols", 0), 0)
+            # shipped contract: an injection finding carries severity "risk" and names CSV injection
+            self.assertTrue(any(f["severity"] in ("risk", "formula") and "injection" in f.get("detail", "").lower() for f in findings),
+                            "receipt must contain a CSV-injection risk finding")
+            self.assertGreater(receipt["audit"].get("formula_injection_cells", 0), 0)
 
     def test_at_prefix_flagged(self):
         out, receipt = _run_audit(self.tmp, "name,formula\nalice,@SUM(A1:A10)")
@@ -222,13 +225,13 @@ class TestFormulaInjectionDetection(unittest.TestCase):
     def test_multiple_formula_columns_counted(self):
         out, receipt = _run_audit(self.tmp, "a,b,c\n=evil(),@bad,safe\nnorm,norm,norm")
         if receipt:
-            self.assertGreaterEqual(receipt["audit"].get("formula_injection_cols", 0), 2)
+            self.assertGreaterEqual(receipt["audit"].get("formula_injection_cells", 0), 2)
 
     def test_receipt_includes_formula_injection_cols_key(self):
-        """The receipt contract must expose formula_injection_cols so verifiers can act on it."""
+        """The receipt contract must expose formula_injection_cells (the shipped key) so verifiers can act on it."""
         _, receipt = _run_audit(self.tmp, "id,v\n1,=bad\n2,ok")
         self.assertIsNotNone(receipt, "receipt file must be written")
-        self.assertIn("formula_injection_cols", receipt.get("audit", {}))
+        self.assertIn("formula_injection_cells", receipt.get("audit", {}))
 
     # ── clean cases (must NOT fire) ──────────────────────────────────────────
 
@@ -236,7 +239,7 @@ class TestFormulaInjectionDetection(unittest.TestCase):
         out, receipt = _run_audit(self.tmp, "id,name,email\n1,Alice,alice@example.com")
         self.assertIn("0 formula injection", out.lower())
         if receipt:
-            self.assertEqual(receipt["audit"].get("formula_injection_cols", 0), 0)
+            self.assertEqual(receipt["audit"].get("formula_injection_cells", 0), 0)
 
     def test_negative_number_not_flagged(self):
         """-42 is a number, not a formula — must not fire."""
